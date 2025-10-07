@@ -202,7 +202,10 @@ class ImageExtractor:
     def export_to_csv(self, ean_codes, filename=None):
         """
         Export product images by EAN to CSV
-        Creates separate files for found and not found EANs
+        Creates 3 separate files:
+        - ALL EANs (found + not found combined)
+        - Found EANs only
+        - Not found EANs only
         """
         try:
             if isinstance(ean_codes, str):
@@ -212,7 +215,7 @@ class ImageExtractor:
             
             if not clean_eans:
                 print("No valid EAN codes provided")
-                return None, None
+                return None, None, None
             
             # Get images data
             images_data = self.get_images_by_ean(clean_eans)
@@ -221,9 +224,11 @@ class ImageExtractor:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             if filename:
                 base_name = filename.replace('.csv', '')
+                filename_all = f"{base_name}_ALL_{timestamp}.csv"
                 filename_found = f"{base_name}_FOUND_{timestamp}.csv"
                 filename_not_found = f"{base_name}_NOT_FOUND_{timestamp}.csv"
             else:
+                filename_all = f"images_by_ean_ALL_{timestamp}.csv"
                 filename_found = f"images_by_ean_FOUND_{timestamp}.csv"
                 filename_not_found = f"images_by_ean_NOT_FOUND_{timestamp}.csv"
             
@@ -234,8 +239,8 @@ class ImageExtractor:
             found_eans = []
             not_found_eans = []
             
-            # Write FOUND EANs file
-            with open(filename_found, 'w', encoding='utf-8', newline='') as f:
+            # Write ALL EANs file (found + not found combined)
+            with open(filename_all, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
                 
@@ -256,23 +261,50 @@ class ImageExtractor:
                             row_data.get('image_9', ''),
                             row_data.get('image_10', '')
                         ])
+                    else:
+                        not_found_eans.append(ean)
+                        writer.writerow([ean, '', '', '', '', '', '', '', '', '', ''])
+            
+            # Write FOUND EANs file
+            with open(filename_found, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                
+                for ean in found_eans:
+                    row_data = images_data[ean]
+                    writer.writerow([
+                        ean,
+                        row_data.get('image_1', ''),
+                        row_data.get('image_2', ''),
+                        row_data.get('image_3', ''),
+                        row_data.get('image_4', ''),
+                        row_data.get('image_5', ''),
+                        row_data.get('image_6', ''),
+                        row_data.get('image_7', ''),
+                        row_data.get('image_8', ''),
+                        row_data.get('image_9', ''),
+                        row_data.get('image_10', '')
+                    ])
             
             # Write NOT FOUND EANs file
             with open(filename_not_found, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
                 
-                for ean in clean_eans:
-                    if ean not in images_data:
-                        not_found_eans.append(ean)
-                        writer.writerow([ean, '', '', '', '', '', '', '', '', '', ''])
+                for ean in not_found_eans:
+                    writer.writerow([ean, '', '', '', '', '', '', '', '', '', ''])
             
             # Calculate file sizes
+            file_size_all = os.path.getsize(filename_all) / 1024
             file_size_found = os.path.getsize(filename_found) / 1024
             file_size_not_found = os.path.getsize(filename_not_found) / 1024
             
             print(f"\nExport completed!")
             print("=" * 60)
+            print(f"ALL EANs File: {filename_all}")
+            print(f"  Total EANs: {len(clean_eans)}")
+            print(f"  File size: {file_size_all:.2f} KB")
+            print()
             print(f"FOUND EANs File: {filename_found}")
             print(f"  EANs found: {len(found_eans)}")
             print(f"  File size: {file_size_found:.2f} KB")
@@ -286,11 +318,11 @@ class ImageExtractor:
             print(f"  Found: {len(found_eans)} ({len(found_eans)/len(clean_eans)*100:.1f}%)")
             print(f"  Not Found: {len(not_found_eans)} ({len(not_found_eans)/len(clean_eans)*100:.1f}%)")
             
-            return filename_found, filename_not_found
+            return filename_all, filename_found, filename_not_found
             
         except Exception as e:
             print(f"Export error: {e}")
-            return None, None
+            return None, None, None
 
 
 def main():

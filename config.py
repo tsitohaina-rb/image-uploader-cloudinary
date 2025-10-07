@@ -14,6 +14,6 @@ cloudinary.config(
 )
 
 # Optional: Additional configuration settings
-CLOUDINARY_FOLDER = "Tests"  # Folder name in Cloudinary
+CLOUDINARY_FOLDER = "Devred"  # Folder name in Cloudinary
 USE_FILENAME = True  # Use original filename
 UNIQUE_FILENAME = True  # Add unique suffix to avoid duplicates
