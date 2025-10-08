@@ -5,3 +5,4 @@ six==1.17.0
 urllib3==2.5.0
 mysql-connector-python==9.4.0
 dropbox==11.36.2
+setuptools>=68.0.0

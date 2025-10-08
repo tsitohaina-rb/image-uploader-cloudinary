@@ -220,17 +220,22 @@ class ImageExtractor:
             # Get images data
             images_data = self.get_images_by_ean(clean_eans)
             
+            # Ensure output directory exists
+            output_dir = os.path.join('data', 'output')
+            os.makedirs(output_dir, exist_ok=True)
+            
             # Generate filenames
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             if filename:
-                base_name = filename.replace('.csv', '')
-                filename_all = f"{base_name}_ALL_{timestamp}.csv"
-                filename_found = f"{base_name}_FOUND_{timestamp}.csv"
-                filename_not_found = f"{base_name}_NOT_FOUND_{timestamp}.csv"
+                # Get the base name from the input file (without extension and path)
+                base_name = os.path.splitext(os.path.basename(filename))[0]
             else:
-                filename_all = f"images_by_ean_ALL_{timestamp}.csv"
-                filename_found = f"images_by_ean_FOUND_{timestamp}.csv"
-                filename_not_found = f"images_by_ean_NOT_FOUND_{timestamp}.csv"
+                base_name = 'images_by_ean'
+                
+            # Create filenames with input filename and timestamp
+            filename_all = os.path.join(output_dir, f"{base_name}_ALL_{timestamp}.csv")
+            filename_found = os.path.join(output_dir, f"{base_name}_FOUND_{timestamp}.csv")
+            filename_not_found = os.path.join(output_dir, f"{base_name}_NOT_FOUND_{timestamp}.csv")
             
             headers = ['ean', 'image_1', 'image_2', 'image_3', 'image_4', 
                       'image_5', 'image_6', 'image_7', 'image_8', 'image_9', 'image_10']
@@ -375,7 +380,7 @@ def main():
                         
                         if eans:
                             print(f"Loaded {len(eans)} EAN codes from file")
-                            extractor.export_to_csv(eans)
+                            extractor.export_to_csv(eans, filename=file_path)
                         else:
                             print("No valid EAN codes found in file")
                     except Exception as e:

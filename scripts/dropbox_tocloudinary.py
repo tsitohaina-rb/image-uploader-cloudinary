@@ -1,6 +1,9 @@
 import os
 import csv
 import sys
+import json
+import hashlib
+import logging
 import cloudinary.uploader
 import dropbox
 from pathlib import Path
@@ -9,96 +12,207 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import time
 import tempfile
+from datetime import datetime
+
+# Setup directory structure
+DATA_DIR = 'data'
+CACHE_DIR = os.path.join(DATA_DIR, 'cache')
+LOG_DIR = os.path.join(DATA_DIR, 'log')
+OUTPUT_DIR = os.path.join(DATA_DIR, 'output')
+
+# Create necessary directories
+for directory in [CACHE_DIR, LOG_DIR, OUTPUT_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+# Configure logging
+def setup_logging(folder_name):
+    """Setup logging with timestamp and folder-specific log file"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = os.path.join(LOG_DIR, f'{folder_name}_{timestamp}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+    return log_filename
 
 # Thread-safe counter and lock for progress tracking
 progress_lock = Lock()
-progress_counter = {'uploaded': 0, 'failed': 0, 'total': 0}
+progress_counter = {'uploaded': 0, 'failed': 0, 'total': 0, 'skipped': 0}
 error_log = []
 
-def upload_single_image_from_dropbox(dbx, dropbox_path, folder_name):
-    """
-    Download image from Dropbox and upload to Cloudinary.
+class UploadCache:
+    """Manages the cache of uploaded files to support resume functionality"""
     
-    Args:
-        dbx: Dropbox client instance
-        dropbox_path (str): Path to file in Dropbox
-        folder_name (str): Name of the Dropbox folder (used for Cloudinary folder)
+    def __init__(self, folder_path: str):
+        """Initialize cache for a specific Dropbox folder"""
+        self.folder_path = folder_path
         
-    Returns:
-        dict: Result dictionary with upload information
-    """
-    try:
-        # Download file from Dropbox to temporary location
-        _, response = dbx.files_download(dropbox_path)
-        file_data = response.content
-        
-        # Get filename and extension
-        filename = os.path.basename(dropbox_path)
-        file_stem = os.path.splitext(filename)[0]
-        original_extension = os.path.splitext(filename)[1].lower().replace('.', '')
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_file:
-            tmp_file.write(file_data)
-            tmp_path = tmp_file.name
-        
+        # Create a unique cache file name based on the folder path
+        folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
+        self.cache_file = os.path.join(CACHE_DIR, f'upload_cache_{folder_hash}.json')
+        self.lock = Lock()
+        self.cache = self._load_cache()
+    
+    def _load_cache(self) -> dict:
+        """Load the cache from file"""
         try:
-            # Upload to Cloudinary with original filename preserved
-            response = cloudinary.uploader.upload(
-                tmp_path,
-                folder=folder_name,
-                public_id=file_stem,  # Use original filename without extension
-                use_filename=False,    # Don't use the temp filename
-                unique_filename=False, # Don't add unique suffix
-                overwrite=True,        # Allow overwriting if file exists
-                format=original_extension
-            )
-            
-            result = {
-                'local_filename': file_stem,
-                'cloudinary_url': response['secure_url'],
-                'status': 'success'
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load cache file: {e}")
+        return {
+            'folder_path': '',
+            'last_run': '',
+            'successful_uploads': {},
+            'failed_uploads': {}
+        }
+    
+    def _save_cache(self):
+        """Save the cache to file"""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self.cache, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save cache file: {e}")
+    
+    def is_uploaded(self, file_path: str) -> bool:
+        """Check if a file was successfully uploaded in previous runs"""
+        with self.lock:
+            return file_path in self.cache['successful_uploads']
+    
+    def mark_uploaded(self, file_path: str, result: dict):
+        """Mark a file as successfully uploaded"""
+        with self.lock:
+            self.cache['folder_path'] = self.folder_path
+            self.cache['last_run'] = datetime.now().isoformat()
+            self.cache['successful_uploads'][file_path] = {
+                'timestamp': datetime.now().isoformat(),
+                'cloudinary_url': result['cloudinary_url'],
+                'public_id': result.get('public_id', ''),
             }
-            
-            # Update progress
-            with progress_lock:
-                progress_counter['uploaded'] += 1
-                current = progress_counter['uploaded'] + progress_counter['failed']
-                if current % 100 == 0 or current == progress_counter['total']:
-                    print(f"Progress: {current}/{progress_counter['total']} "
-                          f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']})")
-            
-            return result
-            
-        finally:
-            # Clean up temporary file
-            os.unlink(tmp_path)
-        
-    except Exception as e:
-        error_message = str(e)
-        
+            if file_path in self.cache['failed_uploads']:
+                del self.cache['failed_uploads'][file_path]
+            self._save_cache()
+    
+    def mark_failed(self, file_path: str, error: str):
+        """Mark a file as failed upload"""
+        with self.lock:
+            self.cache['folder_path'] = self.folder_path
+            self.cache['last_run'] = datetime.now().isoformat()
+            self.cache['failed_uploads'][file_path] = {
+                'timestamp': datetime.now().isoformat(),
+                'error': error
+            }
+            self._save_cache()
+    
+    def get_stats(self) -> dict:
+        """Get cache statistics"""
+        return {
+            'successful': len(self.cache['successful_uploads']),
+            'failed': len(self.cache['failed_uploads']),
+            'last_run': self.cache['last_run']
+        }
+
+def upload_single_image_from_dropbox(dbx, dropbox_path, folder_name, cache):
+    """
+    Cloud-to-cloud: get a temporary Dropbox download URL and let Cloudinary fetch it directly.
+    """
+    logging.info(f"Processing: {dropbox_path}")
+    
+    # Already uploaded? return cached result and update progress
+    if cache.is_uploaded(dropbox_path):
         with progress_lock:
-            progress_counter['failed'] += 1
-            # Log first 10 errors for debugging
-            if len(error_log) < 10:
-                error_log.append(f"{os.path.basename(dropbox_path)}: {error_message}")
-                print(f"ERROR processing {os.path.basename(dropbox_path)}: {error_message}")
-            
-            current = progress_counter['uploaded'] + progress_counter['failed']
+            progress_counter['skipped'] += 1
+            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+            logging.info(f"SKIPPED: {dropbox_path} (previously uploaded)")
             if current % 100 == 0 or current == progress_counter['total']:
                 print(f"Progress: {current}/{progress_counter['total']} "
-                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']})")
+                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
+                      f"Skipped: {progress_counter['skipped']})")
+
+        cached_data = cache.cache['successful_uploads'][dropbox_path]
+        return {
+            'local_filename': os.path.splitext(os.path.basename(dropbox_path))[0],
+            'cloudinary_url': cached_data['cloudinary_url'],
+            'status': 'skipped',
+            'public_id': cached_data.get('public_id', '')
+        }
+
+    try:
+        logging.info(f"START TRANSFER: {dropbox_path}")
         
+        # 1) Ask Dropbox for a temporary direct link (valid ~4 hours)
+        logging.info(f"  Getting Dropbox link: {dropbox_path}")
+        tmp_link_resp = dbx.files_get_temporary_link(dropbox_path)
+        tmp_url = tmp_link_resp.link  # public direct-download URL
+        logging.info(f"  Got temporary link for: {dropbox_path}")
+
+        # 2) Derive filename / extension for Cloudinary options
         filename = os.path.basename(dropbox_path)
-        file_stem = os.path.splitext(filename)[0]
-        
+        file_stem, ext = os.path.splitext(filename)
+        original_extension = ext.lower().replace('.', '')
+        logging.info(f"  Uploading to Cloudinary as: {file_stem}.{original_extension}")
+
+        # 3) Cloudinary pulls the file from Dropbox URL (no local download)
+        response = cloudinary.uploader.upload(
+            tmp_url,
+            folder=folder_name,
+            public_id=file_stem,       # use original filename without extension
+            use_filename=False,        # don't use remote URL name
+            unique_filename=False,     # keep stable public_id
+            overwrite=True,            # allow re-runs to overwrite
+            format=original_extension, # keep original extension
+            resource_type="image"      # or "auto" if you might have videos/svg/others
+        )
+
+        result = {
+            'local_filename': file_stem,
+            'cloudinary_url': response['secure_url'],
+            'status': 'success',
+            'public_id': response.get('public_id', '')
+        }
+
+        # 4) Cache + progress
+        cache.mark_uploaded(dropbox_path, result)
+        with progress_lock:
+            progress_counter['uploaded'] += 1
+            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+            logging.info(f"SUCCESS: {dropbox_path} → {result['cloudinary_url']}")
+            if current % 100 == 0 or current == progress_counter['total']:
+                print(f"Progress: {current}/{progress_counter['total']} "
+                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
+                      f"Skipped: {progress_counter['skipped']})")
+
+        return result
+
+    except Exception as e:
+        error_message = str(e)
+        with progress_lock:
+            progress_counter['failed'] += 1
+            if len(error_log) < 10:
+                error_log.append(f"{os.path.basename(dropbox_path)}: {error_message}")
+            logging.error(f"FAILED: {dropbox_path}")
+            logging.error(f"Error details: {error_message}")
+            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+            if current % 100 == 0 or current == progress_counter['total']:
+                print(f"Progress: {current}/{progress_counter['total']} "
+                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
+                      f"Skipped: {progress_counter['skipped']})")
+
+        file_stem = os.path.splitext(os.path.basename(dropbox_path))[0]
+        cache.mark_failed(dropbox_path, error_message)
         return {
             'local_filename': file_stem,
             'cloudinary_url': 'UPLOAD_FAILED',
             'status': 'failed',
             'error': error_message
         }
-
 
 def test_cloudinary_connection():
     """Test if Cloudinary is properly configured."""
@@ -205,6 +319,7 @@ def get_images_from_dropbox_folder(dbx, folder_path):
 def upload_dropbox_folder_to_cloudinary(dropbox_folder_path, max_workers=10):
     """
     Upload images from a Dropbox folder to Cloudinary using multi-threading.
+    Supports resuming interrupted uploads through caching.
     
     Args:
         dropbox_folder_path (str): Path to folder in Dropbox (e.g., '/my_images')
@@ -255,19 +370,32 @@ def upload_dropbox_folder_to_cloudinary(dropbox_folder_path, max_workers=10):
         print(f"No images found in '{dropbox_folder_path}'")
         return
     
-    # Generate CSV filename based on folder name
-    output_csv = f"{folder_name}.csv"
+    # Setup logging
+    log_file = setup_logging(folder_name)
+    
+    # Generate CSV filename based on folder name with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_csv = os.path.join(OUTPUT_DIR, f"{folder_name}_{timestamp}.csv")
+    
+    # Initialize upload cache
+    cache = UploadCache(dropbox_folder_path)
+    cache_stats = cache.get_stats()
     
     # Initialize progress counter
     progress_counter['total'] = len(image_files)
     progress_counter['uploaded'] = 0
     progress_counter['failed'] = 0
+    progress_counter['skipped'] = 0
     error_log.clear()
     
-    print(f"Folder: {folder_name}")
-    print(f"Found {len(image_files)} images to upload...")
-    print(f"Using {max_workers} concurrent threads for faster upload")
-    print(f"Output CSV: {output_csv}\n")
+    logging.info(f"Processing folder: {folder_name}")
+    logging.info(f"Found {len(image_files)} images to process")
+    if cache_stats['successful'] > 0:
+        logging.info(f"Cache found: {cache_stats['successful']} previously uploaded files will be skipped")
+        logging.info(f"Last upload run: {cache_stats['last_run']}")
+    logging.info(f"Using {max_workers} concurrent threads for faster upload")
+    logging.info(f"Output will be saved to: {output_csv}")
+    logging.info(f"Log file: {log_file}\n")
     
     start_time = time.time()
     results = []
@@ -276,14 +404,24 @@ def upload_dropbox_folder_to_cloudinary(dropbox_folder_path, max_workers=10):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all upload tasks
         future_to_image = {
-            executor.submit(upload_single_image_from_dropbox, dbx, img, folder_name): img 
+            executor.submit(upload_single_image_from_dropbox, dbx, img, folder_name, cache): img 
             for img in image_files
         }
         
         # Collect results as they complete
         for future in as_completed(future_to_image):
-            result = future.result()
-            results.append(result)
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                img = future_to_image[future]
+                print(f"❌ Unexpected error processing {img}: {e}")
+                results.append({
+                    'local_filename': os.path.splitext(os.path.basename(img))[0],
+                    'cloudinary_url': 'UPLOAD_FAILED',
+                    'status': 'failed',
+                    'error': str(e)
+                })
     
     elapsed_time = time.time() - start_time
     
@@ -299,15 +437,24 @@ def upload_dropbox_folder_to_cloudinary(dropbox_folder_path, max_workers=10):
             
             successful = sum(1 for r in results if r['status'] == 'success')
             failed = sum(1 for r in results if r['status'] == 'failed')
+            skipped = sum(1 for r in results if r['status'] == 'skipped')
             
             print(f"\n{'='*60}")
             print(f"✓ Upload completed in {elapsed_time:.2f} seconds")
             if successful > 0:
                 print(f"✓ Average speed: {successful/elapsed_time:.2f} images/second")
             print(f"✓ Results saved to '{output_csv}'")
-            print(f"  Total images: {len(image_files)}")
-            print(f"  Successful uploads: {successful}")
+            print(f"  Total images processed: {len(image_files)}")
+            print(f"  Successfully uploaded: {successful}")
+            print(f"  Previously uploaded (skipped): {skipped}")
             print(f"  Failed uploads: {failed}")
+            
+            # Cache statistics
+            cache_stats = cache.get_stats()
+            print(f"\nCache Status:")
+            print(f"  Total files in cache: {cache_stats['successful']}")
+            print(f"  Failed files in cache: {cache_stats['failed']}")
+            print(f"  Last upload run: {cache_stats['last_run']}")
             
             if error_log:
                 print(f"\n⚠️  Sample errors (first 10):")
