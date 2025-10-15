@@ -1,6 +1,17 @@
-# Cloudinary Bulk Image Uploader
+# Image Uploader to Cloudinary
 
-This Python script allows you to bulk upload images to Cloudinary using multi-threading for improved performance.
+A comprehensive Python toolkit for uploading images to Cloudinary from various sources: local files, Dropbox, and Google Drive.
+
+## Features
+
+- **Multi-source uploads**: Local files, Dropbox cloud-to-cloud, Google Drive cloud-to-cloud
+- **Multi-threaded uploads**: Concurrent processing for improved performance
+- **Resumable uploads**: Cache system to resume interrupted uploads
+- **Progress tracking**: Real-time progress with success/failure counts
+- **Comprehensive logging**: Detailed logs saved to `data/log/`
+- **CSV output**: Results saved to `data/output/`
+- **Error handling**: Robust error tracking and recovery
+- **File validation**: Supports various image formats (.jpg, .jpeg, .png, .gif, .bmp, .webp, .svg, .tiff, .tif)
 
 ## Prerequisites
 
@@ -47,47 +58,189 @@ This Python script allows you to bulk upload images to Cloudinary using multi-th
 
 ## Usage
 
-1. Place your images in a folder (e.g., `images/`)
+### 1. Local File Upload
 
-2. Run the script using:
+Upload images from your local machine to Cloudinary:
 
-   ```bash
-   python main.py <folder_path> [max_workers]
+```bash
+# Upload all images from a folder
+python scripts/local_tocloudinary.py /path/to/images
+
+# Upload with custom Cloudinary folder name
+python scripts/local_tocloudinary.py /path/to/images my_photos
+
+# Upload single file
+python scripts/local_tocloudinary.py /path/to/image.jpg
+
+# Upload with custom folder name and thread count
+python scripts/local_tocloudinary.py /path/to/images my_photos 15
+```
+
+### 2. Dropbox to Cloudinary
+
+Upload images directly from Dropbox to Cloudinary (cloud-to-cloud):
+
+#### Setup
+
+Add your Dropbox token to `.env`:
+
+```
+DROPBOX_TOKEN=your_dropbox_token_here
+```
+
+#### Usage
+
+```bash
+# List all folders in your Dropbox
+python scripts/dropbox_tocloudinary.py list
+
+# Upload images from a Dropbox folder
+python scripts/dropbox_tocloudinary.py upload /my_images
+
+# Upload with custom thread count
+python scripts/dropbox_tocloudinary.py upload /photos/vacation 15
+```
+
+### 3. Google Drive to Cloudinary
+
+Upload images directly from Google Drive to Cloudinary (cloud-to-cloud):
+
+#### Setup
+
+1. **Create Google Cloud Project** (if you don't have one):
+
+   - Go to [Google Cloud Console](https://console.cloud.google.com/)
+   - Create a new project or select an existing one
+
+2. **Enable Google Drive API**:
+
+   - Go to "APIs & Services" > "Library"
+   - Search for "Google Drive API" and enable it
+
+3. **Create OAuth 2.0 Credentials**:
+
+   - Go to "APIs & Services" > "Credentials"
+   - Click "Create Credentials" > "OAuth client ID"
+   - Configure OAuth consent screen if prompted
+   - Choose "Desktop application" as application type
+   - Download the credentials file as `credentials.json`
+
+4. **Place credentials file**:
+   ```
+   image-uploader-cloudinary/
+   ├── credentials.json  ← Place it here
+   ├── config.py
+   └── ...
    ```
 
-   Arguments:
+#### Usage
 
-   - `folder_path`: Path to the folder containing images (required)
-   - `max_workers`: Number of concurrent upload threads (optional, default: 10)
+```bash
+# List all folders in your Google Drive
+python scripts/googledrive_tocloudinary.py list
 
-   Examples:
+# Upload images from a Google Drive folder (using folder ID)
+python scripts/googledrive_tocloudinary.py upload 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs25kzpKiCkVyiE
 
-   ```bash
-   python main.py ./images
-   python main.py ./my_photos 15
-   ```
+# With custom folder name for Cloudinary
+python scripts/googledrive_tocloudinary.py upload FOLDER_ID my_photos
 
-## Features
+# With custom folder name and thread count
+python scripts/googledrive_tocloudinary.py upload FOLDER_ID my_photos 15
+```
 
-- Multi-threaded uploads for better performance
-- Progress tracking with success/failure counts
-- Error logging for failed uploads
-- CSV output with upload results
-- Supports various image formats (.jpg, .jpeg, .png, .gif, .bmp, .webp, .svg)
-- Preserves original file extensions
-- Configuration through environment variables
+**Finding Google Drive Folder ID**:
 
-## Output
+- From URL: `https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs25kzpKiCkVyiE`
+- The folder ID is: `1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs25kzpKiCkVyiE`
+- Or use the `list` command to see all folders with their IDs
 
-The script will:
+## Additional Tools
 
-1. Create a CSV file with the same name as your input folder
-2. The CSV will contain two columns:
-   - `local_filename`: Original filename without extension
-   - `cloudinary_url`: The Cloudinary URL for successful uploads or 'UPLOAD_FAILED' for failures
+### Image Consolidation Script
 
-## Error Handling
+Consolidate images across product variants based on SKU patterns:
 
-- The script logs the first 10 errors encountered during upload
-- Failed uploads are tracked and reported in the final summary
-- Connection and configuration issues are detected before starting uploads
+```bash
+python scripts/consolidate_images.py --input path/to/your/file.csv
+```
+
+This script groups rows by base SKU (ignoring variant indicators) and copies image URLs across all variants of the same product.
+
+### EAN Image Extraction
+
+Extract product images from MySQL database by EAN codes:
+
+```bash
+python scripts/get_images_by_ean.py
+```
+
+## Output Structure
+
+All scripts generate organized output:
+
+```
+data/
+├── cache/          # Upload caches for resumable uploads
+├── log/           # Detailed execution logs
+└── output/        # CSV results with upload URLs
+```
+
+## Authentication & Security
+
+### Dropbox
+
+- Requires `DROPBOX_TOKEN` in `.env`
+- Get token from [Dropbox Developers](https://www.dropbox.com/developers/apps)
+
+### Google Drive
+
+- Requires `credentials.json` in root directory
+- First-time authentication opens browser for OAuth
+- Tokens cached in `data/cache/token.pickle`
+- Only requests read-only access to Google Drive
+
+### Cloudinary
+
+- Requires cloud name, API key, and API secret in `.env`
+- All uploads respect configured folder structure
+
+## Error Handling & Recovery
+
+- **Resumable uploads**: All scripts cache successful uploads to avoid duplicates
+- **Error logging**: Detailed error tracking with file-specific failure reasons
+- **Progress tracking**: Real-time updates on upload status
+- **Validation**: Pre-upload checks for connectivity and file accessibility
+
+## Troubleshooting
+
+### Google Drive Setup Issues
+
+**"credentials.json not found"**:
+
+- Download credentials from Google Cloud Console
+- Place in root directory with exact filename `credentials.json`
+
+**"Google Drive API not enabled"**:
+
+- Enable Google Drive API in Google Cloud Console
+
+**Permission errors**:
+
+- Ensure you have at least "Viewer" permissions for shared folders
+
+### General Issues
+
+**Python environment**:
+
+- Always activate virtual environment: `source .venv/bin/activate`
+- Install dependencies: `pip install -r requirements.txt`
+
+**Configuration**:
+
+- Verify `.env` file contains correct credentials
+- Check `config.py` for upload settings
+
+## Contributing
+
+This toolkit is designed for scalable image management workflows. Each script follows the same pattern for consistency and maintainability.
