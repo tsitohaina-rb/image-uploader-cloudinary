@@ -6,3 +6,6 @@ urllib3==2.5.0
 mysql-connector-python==9.4.0
 dropbox==11.36.2
 setuptools>=68.0.0
+google-api-python-client==2.149.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
