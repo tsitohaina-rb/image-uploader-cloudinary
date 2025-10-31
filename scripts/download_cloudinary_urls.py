@@ -14,6 +14,34 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+def convert_cloudinary_url_format(url, target_format):
+    """
+    Convert a Cloudinary URL to a different format using f_format transformation
+    
+    Args:
+        url (str): Original Cloudinary URL
+        target_format (str): Target format (jpg, png, webp, etc.)
+    
+    Returns:
+        str: Converted URL with format transformation
+    """
+    if not url or 'cloudinary.com' not in url:
+        return url
+    
+    # Insert the format transformation after /upload/
+    if '/upload/' in url:
+        parts = url.split('/upload/')
+        if len(parts) == 2:
+            base_url = parts[0] + '/upload/'
+            rest_url = parts[1]
+            
+            # Add format transformation right after /upload/
+            converted_url = f"{base_url}f_{target_format}/{rest_url}"
+            
+            return converted_url
+    
+    return url
+
 def setup_cloudinary():
     """Setup Cloudinary configuration"""
     cloudinary.config(
@@ -108,7 +136,7 @@ def get_images_from_folder_search(folder_name, max_results=500):
         print(f"❌ Search API error: {e}")
         return []
 
-def export_to_csv(images, folder_name, output_dir="data/output"):
+def export_to_csv(images, folder_name, output_dir="data/output", target_format=None):
     """
     Export image URLs to CSV file
     
@@ -116,6 +144,7 @@ def export_to_csv(images, folder_name, output_dir="data/output"):
         images (list): List of image resources from Cloudinary
         folder_name (str): Name of the folder (for filename)
         output_dir (str): Output directory for CSV
+        target_format (str): Target format for conversion (jpg, png, webp, etc.)
     
     Returns:
         str: Path to the created CSV file
@@ -123,18 +152,38 @@ def export_to_csv(images, folder_name, output_dir="data/output"):
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
+    # Sanitize folder name for filename (replace slashes and other problematic characters)
+    safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_')
+    
     # Generate timestamp for filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"{folder_name}_URLs_{timestamp}.csv"
+    csv_filename = f"{safe_folder_name}_URLs_{timestamp}.csv"
     csv_path = os.path.join(output_dir, csv_filename)
     
     # Prepare CSV data
     csv_data = []
     
     for img in images:
+        filename = os.path.basename(img.get('public_id', ''))
+        original_url = img.get('secure_url', '')
+        
+        # Apply format conversion if target_format is specified
+        if target_format:
+            # Check if the image is already in the target format by looking at the URL extension
+            url_ext = os.path.splitext(original_url)[1].lower().lstrip('.')
+            if url_ext == target_format.lower() or (target_format.lower() == 'jpg' and url_ext == 'jpeg'):
+                # Keep images that are already in target format unchanged
+                final_url = original_url
+            else:
+                # Convert other formats to target format
+                final_url = convert_cloudinary_url_format(original_url, target_format)
+        else:
+            # No conversion requested, keep original URL
+            final_url = original_url
+        
         csv_data.append({
-            'filename': os.path.basename(img.get('public_id', '')),
-            'secure_url': img.get('secure_url', '')
+            'filename': filename,
+            'secure_url': final_url
         })
     
     # Sort by filename for consistency
@@ -270,6 +319,12 @@ Examples:
         help='Retrieval method: api (default) or search (Search API)'
     )
     
+    parser.add_argument(
+        '--format',
+        dest='target_format',
+        help='Convert URLs to specified format (jpg, png, webp, etc.). Images already in this format will be unchanged.'
+    )
+    
     args = parser.parse_args()
     
     # Setup Cloudinary
@@ -305,9 +360,11 @@ Examples:
     
     # Export to CSV
     try:
-        csv_path = export_to_csv(images, args.folder_name, args.output_dir)
+        csv_path = export_to_csv(images, args.folder_name, args.output_dir, args.target_format)
         print(f"\n✨ Operation completed successfully!")
         print(f"📄 CSV file: {csv_path}")
+        if args.target_format:
+            print(f"🔄 URLs converted to {args.target_format.upper()} format (except those already in {args.target_format.upper()})")
         print(f"🔗 All image URLs are now available in the CSV file")
         
     except Exception as e:
