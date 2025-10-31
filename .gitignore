@@ -20,3 +20,5 @@ __pycache__/
 /eans-10
 /logs/
 /data/*
+credentials-bzc.json
+credentials-regardbeauty.json
