@@ -101,19 +101,21 @@ def get_images_from_folder(folder_name, max_results=500):
         return []
 
 def get_images_from_folder_search(folder_name, max_results=500):
-    """Retrieve images using Cloudinary Search API (supports deeper querying).
+    """Retrieve images using Cloudinary Search API (includes subfolders).
 
     Args:
-        folder_name (str): Folder to search (exact match).
+        folder_name (str): Folder to search (includes subfolders).
         max_results (int): Maximum number of resources to return (use -1 or None for all).
 
     Returns:
         list: List of image resources.
     """
     from cloudinary import Search
-    print(f"🔍 (Search API) Searching for images in folder: {folder_name}")
+    print(f"🔍 (Search API) Searching for images in folder and subfolders: {folder_name}")
 
-    expression = f'folder="{folder_name}"'
+    # Use prefix-based search to include subfolders
+    # Try different search patterns for Cloudinary Search API
+    expression = f'folder:"{folder_name}" OR folder:"{folder_name}/*"'
     search = Search().expression(expression).max_results(500)
     all_resources = []
     try:
