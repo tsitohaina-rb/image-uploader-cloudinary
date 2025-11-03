@@ -9,6 +9,8 @@ import ssl
 import socket
 import requests
 import gc
+import urllib.parse
+from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from functools import wraps
@@ -43,17 +45,29 @@ except ImportError:
 for directory in [CACHE_DIR, LOG_DIR, OUTPUT_DIR]:
     os.makedirs(directory, exist_ok=True)
 
-# Set socket timeout globally to 30 seconds
-socket.setdefaulttimeout(30)
+# Set socket timeout globally to 60 seconds (increased for better stability)
+socket.setdefaulttimeout(60)
+
+# SSL Context configuration for better multi-threading stability
+import ssl
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+
+# Threading-specific configuration
+import threading
+threading_local = threading.local()
 
 # Retry decorator with exponential backoff for network issues
-def retry_with_backoff(max_retries=3, backoff_factor=2, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, Exception)):
+def retry_with_backoff(max_retries=5, backoff_factor=3, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, OSError, Exception)):
     """
     Decorator to retry functions with exponential backoff on specified exceptions.
+    Enhanced for SSL stability in multi-threading environments.
     
     Args:
-        max_retries (int): Maximum number of retry attempts
-        backoff_factor (float): Multiplier for delay between retries
+        max_retries (int): Maximum number of retry attempts (increased to 5)
+        backoff_factor (float): Multiplier for delay between retries (increased to 3)
         exceptions (tuple): Tuple of exception types to catch and retry
     """
     def decorator(func):
@@ -67,10 +81,15 @@ def retry_with_backoff(max_retries=3, backoff_factor=2, exceptions=(ssl.SSLError
                         # Last attempt, re-raise the exception
                         raise e
                     
-                    wait_time = backoff_factor ** attempt
+                    # Progressive backoff with jitter to avoid thundering herd
+                    base_wait = backoff_factor ** attempt
+                    jitter = base_wait * 0.1 * (0.5 - hash(threading.current_thread().ident) % 1000 / 1000)
+                    wait_time = base_wait + jitter
+                    
                     error_type = type(e).__name__
-                    logging.warning(f"  Attempt {attempt + 1} failed with {error_type}: {str(e)}")
-                    logging.info(f"  Retrying in {wait_time} seconds...")
+                    thread_id = threading.current_thread().ident
+                    logging.warning(f"  [Thread {thread_id}] Attempt {attempt + 1} failed with {error_type}: {str(e)}")
+                    logging.info(f"  [Thread {thread_id}] Retrying in {wait_time:.2f} seconds...")
                     time.sleep(wait_time)
             return None
         return wrapper
@@ -80,22 +99,38 @@ def retry_with_backoff(max_retries=3, backoff_factor=2, exceptions=(ssl.SSLError
 def create_robust_session():
     """
     Create a requests session with proper retry strategy and connection pooling.
+    Optimized for multi-threading to avoid SSL errors.
     """
     session = requests.Session()
+    
+    # SSL-safe retry strategy with longer backoff
     retry_strategy = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        raise_on_status=False
+        total=5,  # Increased retries
+        backoff_factor=2,  # Longer backoff
+        status_forcelist=[429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
+        raise_on_status=False,
+        allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"]
     )
+    
+    # Conservative connection pooling to avoid SSL conflicts
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
-        pool_connections=3,  # Reduced from default 10
-        pool_maxsize=3       # Reduced from default 10
+        pool_connections=1,  # One connection per thread
+        pool_maxsize=1       # Single connection in pool
     )
+    
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    
     return session
+
+def get_thread_session():
+    """
+    Get a thread-local session to avoid SSL conflicts between threads.
+    """
+    if not hasattr(threading_local, 'session'):
+        threading_local.session = create_robust_session()
+    return threading_local.session
 
 # Google Drive API scopes - Updated to include full drive access for file permissions
 SCOPES = [
@@ -108,7 +143,11 @@ SCOPES = [
 def setup_logging(folder_name):
     """Setup logging with timestamp and folder-specific log file"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_filename = os.path.join(LOG_DIR, f'{folder_name}_{timestamp}.log')
+    
+    # Sanitize folder name for filename (replace problematic characters)
+    safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_')
+    
+    log_filename = os.path.join(LOG_DIR, f'{safe_folder_name}_{timestamp}.log')
     
     logging.basicConfig(
         level=logging.INFO,
@@ -119,6 +158,72 @@ def setup_logging(folder_name):
         ]
     )
     return log_filename
+
+def is_cloudinary_url(url):
+    """Check if a URL is a Cloudinary URL"""
+    if not url or not isinstance(url, str):
+        return False
+    return 'cloudinary.com' in url.lower()
+
+def get_current_format(url):
+    """Extract the current format from a Cloudinary URL"""
+    if not is_cloudinary_url(url):
+        return None
+    
+    # Parse the URL path to find format
+    parsed = urllib.parse.urlparse(url)
+    path_parts = parsed.path.split('/')
+    
+    # Look for format parameter (f_xxx) or file extension
+    for part in path_parts:
+        if part.startswith('f_'):
+            return part[2:]  # Remove 'f_' prefix
+    
+    # Check file extension in the last part
+    if path_parts:
+        last_part = path_parts[-1]
+        if '.' in last_part:
+            return last_part.split('.')[-1].lower()
+    
+    return None
+
+def convert_cloudinary_url_to_jpg(url):
+    """Convert a Cloudinary URL to JPG format"""
+    if not is_cloudinary_url(url):
+        return url
+    
+    # Parse the URL
+    parsed = urllib.parse.urlparse(url)
+    path_parts = parsed.path.split('/')
+    
+    # Find the upload part and insert format transformation
+    if '/image/upload/' in parsed.path:
+        upload_index = None
+        for i, part in enumerate(path_parts):
+            if part == 'upload':
+                upload_index = i
+                break
+        
+        if upload_index is not None:
+            # Insert JPG format transformation after 'upload'
+            path_parts.insert(upload_index + 1, 'f_jpg')
+            
+            # Rebuild the path
+            new_path = '/'.join(path_parts)
+            
+            # Rebuild the URL
+            new_url = urllib.parse.urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                new_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+            
+            return new_url
+    
+    return url  # Return original if transformation failed
 
 def extract_folder_id_from_url(url_or_id):
     """
@@ -242,13 +347,21 @@ error_log = []
 class UploadCache:
     """Manages the cache of uploaded files to support resume functionality"""
     
-    def __init__(self, folder_path: str):
+    def __init__(self, folder_path: str, folder_name: str = None):
         """Initialize cache for a specific Google Drive folder"""
         self.folder_path = folder_path
         
-        # Create a unique cache file name based on the folder path
-        folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
-        self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{folder_hash}.json')
+        # Create cache file name consistent with log and output files
+        if folder_name:
+            # Sanitize folder name for filename (same as done for log filename)
+            safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json')
+        else:
+            # Fallback to hash-based naming if no folder name provided
+            folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
+            self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{folder_hash}.json')
+        
         self.lock = Lock()
         self.cache = self._load_cache()
     
@@ -494,18 +607,49 @@ def load_previous_progress(folder_id):
 def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache):
     """
     Cloud-to-cloud: Create a temporary public link and let Cloudinary fetch it directly.
+    Enhanced with thread-local sessions to avoid SSL conflicts.
     """
     file_id = file_info['id']
     filename = file_info['name']
     folder_path = file_info.get('folder_path', '')
     
-    # Create the full Cloudinary folder path
-    if folder_path:
-        cloudinary_folder = f"{base_folder_name}/{folder_path}"
-    else:
-        cloudinary_folder = base_folder_name
+    # Get thread-local session for this upload
+    session = get_thread_session()
     
-    logging.info(f"Processing: {filename} (ID: {file_id}) → {cloudinary_folder}")
+    # Create the full Cloudinary folder path with comprehensive whitespace cleaning
+    if folder_path:
+        # Clean both components and the combined path
+        clean_base = base_folder_name.strip()
+        clean_folder_path = folder_path.strip()
+        cloudinary_folder = f"{clean_base}/{clean_folder_path}"
+    else:
+        cloudinary_folder = base_folder_name.strip()
+    
+    # Comprehensive whitespace cleaning: 
+    # 1. Strip leading/trailing spaces
+    # 2. Remove trailing forward slashes
+    # 3. Clean up spaces around forward slashes
+    # 4. Remove multiple consecutive spaces
+    cloudinary_folder = cloudinary_folder.strip().rstrip('/')
+    
+    # Clean spaces around forward slashes: " / " becomes "/"
+    cloudinary_folder = re.sub(r'\s*/\s*', '/', cloudinary_folder)
+    
+    # Remove multiple consecutive spaces
+    cloudinary_folder = re.sub(r'\s+', ' ', cloudinary_folder)
+    
+    # Final strip to ensure no trailing whitespace
+    cloudinary_folder = cloudinary_folder.strip()
+    
+    # Debug logging to see exact folder path
+    logging.info(f"  Final cloudinary folder path: '{cloudinary_folder}' (length: {len(cloudinary_folder)})")
+    if cloudinary_folder.endswith(' '):
+        logging.warning(f"  WARNING: Folder path still ends with whitespace!")
+        cloudinary_folder = cloudinary_folder.rstrip()
+        logging.info(f"  Cleaned folder path: '{cloudinary_folder}'")
+    
+    thread_id = threading.current_thread().ident
+    logging.info(f"[Thread {thread_id}] Processing: {filename} (ID: {file_id}) → {cloudinary_folder}")
     
     # Already uploaded? return cached result and update progress
     if cache.is_uploaded(file_id):
@@ -525,9 +669,19 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
                       f"Skipped: {progress_counter['skipped']})")
 
         cached_data = cache.cache['successful_uploads'][file_id]
+        original_url = cached_data['cloudinary_url']
+        
+        # Generate JPG URL for cached result
+        jpg_url = original_url
+        if is_cloudinary_url(original_url):
+            current_format = get_current_format(original_url)
+            if current_format == 'png':
+                jpg_url = convert_cloudinary_url_to_jpg(original_url)
+        
         return {
             'local_filename': os.path.splitext(filename)[0],
-            'cloudinary_url': cached_data['cloudinary_url'],
+            'cloudinary_url': original_url,
+            'jpg_url': jpg_url,
             'status': 'skipped',
             'public_id': cached_data.get('public_id', ''),
             'folder_path': folder_path
@@ -565,17 +719,24 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         original_extension = ext.lower().replace('.', '') if ext else 'jpg'
         logging.info(f"  Uploading to Cloudinary as: {file_stem}.{original_extension}")
 
-        # 4) Cloudinary pulls the file directly from Google Drive
-        response = cloudinary.uploader.upload(
-            download_url,
-            folder=cloudinary_folder,       # Use the organized folder path
-            public_id=file_stem,            # use original filename without extension
-            use_filename=False,             # don't use remote URL name
-            unique_filename=False,          # keep stable public_id
-            overwrite=True,                 # allow re-runs to overwrite
-            format=original_extension,      # keep original extension
-            resource_type="image"           # or "auto" if you might have videos/svg/others
-        )
+        # 4) Cloudinary pulls the file directly from Google Drive with enhanced error handling
+        try:
+            response = cloudinary.uploader.upload(
+                download_url,
+                folder=cloudinary_folder,       # Use the organized folder path
+                public_id=file_stem,            # use original filename without extension
+                use_filename=False,             # don't use remote URL name
+                unique_filename=False,          # keep stable public_id
+                overwrite=True,                 # allow re-runs to overwrite
+                format=original_extension,      # keep original extension
+                resource_type="image",          # or "auto" if you might have videos/svg/others
+                timeout=120                     # Extended timeout for Cloudinary
+            )
+        except Exception as cloudinary_error:
+            # If Cloudinary upload fails, add extra context
+            error_msg = f"Cloudinary upload failed: {str(cloudinary_error)}"
+            logging.error(f"[Thread {thread_id}] {error_msg}")
+            raise Exception(error_msg)
 
         result = {
             'local_filename': file_stem,
@@ -585,6 +746,18 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             'filename': filename,
             'folder_path': folder_path
         }
+        
+        # Add JPG URL for successful upload
+        original_url = response['secure_url']
+        if is_cloudinary_url(original_url):
+            current_format = get_current_format(original_url)
+            if current_format == 'png':
+                result['jpg_url'] = convert_cloudinary_url_to_jpg(original_url)
+                logging.info(f"  🔄 Generated JPG URL: {filename}")
+            else:
+                result['jpg_url'] = original_url  # Already JPG or other format
+        else:
+            result['jpg_url'] = original_url  # Not a Cloudinary URL
 
         # 5) Cache + progress + real-time logging
         cache.mark_uploaded(file_id, result)
@@ -637,6 +810,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         return {
             'local_filename': file_stem,
             'cloudinary_url': 'UPLOAD_FAILED',
+            'jpg_url': 'UPLOAD_FAILED',
             'status': 'failed',
             'error': error_message,
             'folder_path': folder_path
@@ -1005,8 +1179,8 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
                     'name': item['name'],
                     'mimeType': item['mimeType'],
                     'size': item.get('size', 0),
-                    'folder_path': parent_path,  # Store the folder path for Cloudinary organization
-                    'folder_name': folder_name
+                    'folder_path': parent_path.strip() if parent_path else '',  # Clean the folder path
+                    'folder_name': folder_name.strip() if folder_name else ''
                 })
             
             page_token = results.get('nextPageToken')
@@ -1030,7 +1204,9 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
                 
                 subfolders = results.get('files', [])
                 for subfolder in subfolders:
-                    subfolder_path = f"{parent_path}/{subfolder['name']}" if parent_path else subfolder['name']
+                    # Clean subfolder name to remove any whitespace
+                    clean_subfolder_name = subfolder['name'].strip()
+                    subfolder_path = f"{parent_path.strip()}/{clean_subfolder_name}" if parent_path else clean_subfolder_name
                     print(f"  📁 Scanning subfolder: {subfolder_path}")
                     
                     # Recursively get images from subfolder
@@ -1039,7 +1215,7 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
                         subfolder['id'], 
                         recursive=True, 
                         parent_path=subfolder_path,
-                        folder_name=subfolder['name']
+                        folder_name=clean_subfolder_name
                     )
                     image_files.extend(subfolder_images)
                 
@@ -1052,15 +1228,16 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
     
     return image_files
 
-def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=3, recursive=True):
+def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=5, recursive=True):
     """
     Upload images from a Google Drive folder to Cloudinary using multi-threading.
     Supports resuming interrupted uploads through caching and recursive subfolder scanning.
+    Enhanced with SSL-safe threading for better stability.
     
     Args:
         folder_id (str): Google Drive folder ID
         folder_name (str): Optional custom folder name for Cloudinary (default: uses Drive folder name)
-        max_workers (int): Number of concurrent upload threads (default: 3, reduced for stability)
+        max_workers (int): Number of concurrent upload threads (default: 5, optimized for SSL stability)
         recursive (bool): If True, scan and upload from subfolders recursively (default: True)
     """
     
@@ -1095,10 +1272,12 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     if not folder_name:
         try:
             folder_info = service.files().get(fileId=folder_id, fields="name").execute()
-            folder_name = folder_info['name']
+            folder_name = folder_info['name'].strip()  # Remove leading/trailing whitespace
         except Exception as e:
             print(f"Error getting folder name: {e}")
             folder_name = f"gdrive_folder_{folder_id}"
+    else:
+        folder_name = folder_name.strip()  # Also trim user-provided folder names
     
     # Get all images from Google Drive folder (with recursive scanning)
     print(f"Scanning Google Drive folder: {folder_name} (ID: {folder_id})")
@@ -1140,10 +1319,14 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     
     # Generate CSV filename based on folder name with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_csv = os.path.join(OUTPUT_DIR, f"{folder_name}_{timestamp}.csv")
+    
+    # Sanitize folder name for CSV filename (same as done for log filename)
+    safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
+    
+    output_csv = os.path.join(OUTPUT_DIR, f"{safe_folder_name}_{timestamp}.csv")
     
     # Initialize upload cache
-    cache = UploadCache(folder_id)
+    cache = UploadCache(folder_id, folder_name)
     cache_stats = cache.get_stats()
     
     # Initialize progress counter
@@ -1166,13 +1349,18 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     start_time = time.time()
     results = []
     
-    # Use ThreadPoolExecutor for concurrent uploads
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all upload tasks - pass folder_name as base folder
-        future_to_image = {
-            executor.submit(upload_single_image_from_gdrive, service, img, folder_name, cache): img 
-            for img in image_files
-        }
+    # Use ThreadPoolExecutor for concurrent uploads with SSL-safe configuration
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="CloudinaryUpload") as executor:
+        # Submit all upload tasks with staggered submission to avoid SSL conflicts
+        future_to_image = {}
+        
+        for i, img in enumerate(image_files):
+            # Stagger thread submissions to avoid SSL handshake conflicts
+            if i > 0 and i % max_workers == 0:
+                time.sleep(0.5)  # Small delay every batch of threads
+            
+            future = executor.submit(upload_single_image_from_gdrive, service, img, folder_name, cache)
+            future_to_image[future] = img
         
         # Collect results as they complete
         for future in as_completed(future_to_image):
@@ -1181,7 +1369,10 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
                 results.append(result)
             except Exception as e:
                 img = future_to_image[future]
-                print(f"❌ Unexpected error processing {img['name']}: {e}")
+                thread_id = threading.current_thread().ident
+                error_msg = f"Unexpected error processing {img['name']}: {e}"
+                logging.error(f"[Thread {thread_id}] {error_msg}")
+                print(f"❌ {error_msg}")
                 results.append({
                     'local_filename': os.path.splitext(img['name'])[0],
                     'cloudinary_url': 'UPLOAD_FAILED',
@@ -1222,13 +1413,34 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     
     # Write results to CSV
     if results:
-        csv_columns = ['local_filename', 'cloudinary_url', 'folder_path']
+        # Add JPG conversion for all successful uploads
+        for result in results:
+            if result.get('status') == 'success' and result.get('cloudinary_url'):
+                original_url = result['cloudinary_url']
+                if is_cloudinary_url(original_url):
+                    current_format = get_current_format(original_url)
+                    if current_format == 'png':
+                        result['jpg_url'] = convert_cloudinary_url_to_jpg(original_url)
+                        print(f"🔄 Converted PNG to JPG: {result['local_filename']}")
+                    else:
+                        result['jpg_url'] = original_url  # Already JPG or other format
+                else:
+                    result['jpg_url'] = original_url  # Not a Cloudinary URL
+            else:
+                result['jpg_url'] = result.get('cloudinary_url', '')  # Failed uploads
+        
+        csv_columns = ['local_filename', 'cloudinary_url', 'jpg_url', 'folder_path']
         
         try:
             with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=csv_columns, extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(results)
+            
+            # Count conversions for statistics
+            png_conversions = sum(1 for result in results 
+                                if result.get('status') == 'success' 
+                                and result.get('cloudinary_url') != result.get('jpg_url'))
             
             successful = stats_by_status['success']
             failed = stats_by_status['failed']
@@ -1250,6 +1462,7 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
             logging.info(f"  Successfully uploaded: {successful}")
             logging.info(f"  Previously uploaded (skipped): {skipped}")
             logging.info(f"  Failed uploads: {failed}")
+            logging.info(f"  PNG to JPG conversions: {png_conversions}")
             logging.info(f"  Recursive scanning: {recursive}")
             logging.info(f"  Total folders processed: {len(stats_by_folder)}")
             logging.info("")
@@ -1275,6 +1488,9 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
             print(f"  Successfully uploaded: {successful}")
             print(f"  Previously uploaded (skipped): {skipped}")
             print(f"  Failed uploads: {failed}")
+            if png_conversions > 0:
+                print(f"  🔄 PNG to JPG conversions: {png_conversions}")
+                print(f"  💡 Use 'jpg_url' column for optimal JPG format")
             
             # Show detailed folder organization summary
             if len(stats_by_folder) > 1:  # Only show if multiple folders
@@ -1341,14 +1557,14 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python googledrive_tocloudinary.py <command> [arguments]")
         print("\nCommands:")
-        print("  list                                    : List all folders in your Google Drive")
-        print("  shared                                  : List all files and folders shared with you + Shared Drives")
-        print("  drives                                  : List only Shared Drives (Team Drives)")
+        print("  list                                    : List YOUR own folders in Google Drive")
+        print("  shared                                  : List files and folders shared with you (individual shares)")
+        print("  drives                                  : List Shared Drives (Team Drives) and their folders")
         print("  upload <folder_id_or_url> [options]     : Upload images from a Google Drive folder")
         print("\nExamples:")
-        print("  python googledrive_tocloudinary.py list")
-        print("  python googledrive_tocloudinary.py shared")
-        print("  python googledrive_tocloudinary.py drives")
+        print("  python googledrive_tocloudinary.py list      # Show your own folders")
+        print("  python googledrive_tocloudinary.py shared    # Show folders shared with you")
+        print("  python googledrive_tocloudinary.py drives    # Show Shared Drives (Team Drives)")
         print("  # Using folder ID:")
         print("  python googledrive_tocloudinary.py upload 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs25kzpKiCkVyiE")
         print("  # Using Google Drive URL:")
@@ -1356,11 +1572,11 @@ if __name__ == "__main__":
         print("  # With custom folder name:")
         print("  python googledrive_tocloudinary.py upload 'https://drive.google.com/drive/folders/1310NnlTK5tn8fX00TKF_BDAi0o7eK0d2' my_custom_folder")
         print("  # With custom settings:")
-        print("  python googledrive_tocloudinary.py upload 'https://drive.google.com/drive/folders/1310NnlTK5tn8fX00TKF_BDAi0o7eK0d2' my_custom_folder 15 --no-recursive")
+        print("  python googledrive_tocloudinary.py upload 'https://drive.google.com/drive/folders/1310NnlTK5tn8fX00TKF_BDAi0o7eK0d2' my_custom_folder 10 --no-recursive")
         print("\nUpload Arguments:")
         print("  folder_id_or_url : Google Drive folder ID OR full Google Drive URL")
         print("  destination_name : CUSTOM folder name for Cloudinary (optional, default: uses Drive folder name)")
-        print("  threads          : Number of concurrent threads (optional, default: 3)")  
+        print("  threads          : Number of concurrent threads (optional, default: 5, optimized for SSL stability)")  
         print("  --no-recursive   : Disable recursive scanning of subfolders (default: recursive enabled)")
         print("\nSupported URL Formats:")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID")
@@ -1402,14 +1618,16 @@ if __name__ == "__main__":
             print("Failed to authenticate Google Drive")
             sys.exit(1)
         
-        print("Scanning all folders in your Google Drive...\n")
+        print("📁 Scanning YOUR own folders in Google Drive...\n")
         folders = list_all_google_drive_folders(service)
         
         print(f"\n{'='*60}")
-        print(f"Total folders found: {len(folders)}")
+        print(f"📁 Your own folders found: {len(folders)}")
         print(f"{'='*60}")
+        print("\n💡 Use 'shared' command to see files shared with you")
+        print("💡 Use 'drives' command to see Shared Drives (Team Drives)")
         
-    # Handle "shared" command to show files shared with me
+    # Handle "shared" command to show files shared with me (not Shared Drives)
     elif command == "shared":
         print("Testing Google Drive connection...")
         is_connected, message = test_google_drive_connection()
@@ -1426,18 +1644,16 @@ if __name__ == "__main__":
             print("Failed to authenticate Google Drive")
             sys.exit(1)
         
-        print("Scanning all shared content (shared files + Shared Drives)...\n")
-        all_shared = list_all_shared_content(service)
+        print("📋 Scanning files and folders shared with you (not Shared Drives)...\n")
+        shared_items = list_shared_with_me(service)
         
         print(f"\n{'='*60}")
-        print(f"📁 Total shared folders found: {len(all_shared['folders'])}")
-        print(f"   - From files shared with you: {len([f for f in all_shared['folders'] if f.get('source') == 'shared_with_me'])}")
-        print(f"   - From Shared Drives: {len([f for f in all_shared['folders'] if f.get('source') == 'shared_drive'])}")
-        print(f"🖼️  Shared images found: {len(all_shared['files'])}")
-        print(f"🚗 Shared Drives found: {len(all_shared['shared_drives'])}")
+        print(f"📁 Shared folders found: {len(shared_items['folders'])}")
+        print(f"🖼️  Shared images found: {len(shared_items['files'])}")
         print(f"{'='*60}")
         print("\n💡 Use any folder ID above with the 'upload' command")
-        print("💡 Folders from Shared Drives should now be included!")
+        print("💡 Use 'drives' command to see Shared Drives (Team Drives)")
+        print("💡 Use 'list' command to see your own folders")
         
     # Handle "drives" command to show only Shared Drives
     elif command == "drives":
@@ -1521,7 +1737,7 @@ if __name__ == "__main__":
         # Parse arguments
         args = sys.argv[3:]  # Get all arguments after folder_id
         FOLDER_NAME = None
-        MAX_WORKERS = 3
+        MAX_WORKERS = 5  # Increased default for better performance while maintaining SSL stability
         RECURSIVE = True  # Default to recursive
         
         # Process arguments
@@ -1561,6 +1777,10 @@ if __name__ == "__main__":
     
     else:
         print(f"Error: Unknown command '{command}'")
-        print("\nAvailable commands: list, shared, drives, upload")
-        print("Run 'python googledrive_tocloudinary.py' for usage information")
+        print("\nAvailable commands:")
+        print("  list   : Show YOUR own folders in Google Drive")
+        print("  shared : Show files and folders shared with you")
+        print("  drives : Show Shared Drives (Team Drives)")
+        print("  upload : Upload images from any folder (yours or shared)")
+        print("\nRun 'python googledrive_tocloudinary.py' for detailed usage information")
         sys.exit(1)
