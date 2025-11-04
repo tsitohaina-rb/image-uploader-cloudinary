@@ -630,13 +630,8 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
     session = get_thread_session()
     
     # Create the full Cloudinary folder path with comprehensive whitespace cleaning
-    if folder_path:
-        # Clean both components and the combined path
-        clean_base = base_folder_name.strip()
-        clean_folder_path = folder_path.strip()
-        cloudinary_folder = f"{clean_base}/{clean_folder_path}"
-    else:
-        cloudinary_folder = base_folder_name.strip()
+    # Use only the base folder name for a flatter structure
+    cloudinary_folder = base_folder_name.strip()
     
     # Comprehensive whitespace cleaning: 
     # 1. Strip leading/trailing spaces
@@ -734,10 +729,12 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
 
         # 4) Cloudinary pulls the file directly from Google Drive with enhanced error handling
         try:
+            # Combine folder path and filename for the complete public_id
+            complete_public_id = f"{cloudinary_folder}/{file_stem}"
+            
             response = cloudinary.uploader.upload(
                 download_url,
-                folder=cloudinary_folder,       # Use the organized folder path
-                public_id=file_stem,            # use original filename without extension
+                public_id=complete_public_id,   # use complete path as public_id
                 use_filename=False,             # don't use remote URL name
                 unique_filename=False,          # keep stable public_id
                 overwrite=True,                 # allow re-runs to overwrite
