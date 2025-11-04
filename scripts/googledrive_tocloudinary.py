@@ -10,6 +10,7 @@ import socket
 import requests
 import gc
 import urllib.parse
+import glob
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -347,7 +348,7 @@ error_log = []
 class UploadCache:
     """Manages the cache of uploaded files to support resume functionality"""
     
-    def __init__(self, folder_path: str, folder_name: str = None):
+    def __init__(self, folder_path: str, folder_name: str | None = None):
         """Initialize cache for a specific Google Drive folder"""
         self.folder_path = folder_path
         
@@ -355,8 +356,20 @@ class UploadCache:
         if folder_name:
             # Sanitize folder name for filename (same as done for log filename)
             safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json')
+            
+            # Look for existing cache files first
+            cache_pattern = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_*.json')
+            existing_caches = glob.glob(cache_pattern)
+            
+            if existing_caches:
+                # Use the most recent existing cache file
+                self.cache_file = max(existing_caches, key=os.path.getctime)
+                print(f"🔄 RESUMING: Found existing cache file: {os.path.basename(self.cache_file)}")
+            else:
+                # Create new cache file with current timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json')
+                print(f"🆕 STARTING: Creating new cache file: {os.path.basename(self.cache_file)}")
         else:
             # Fallback to hash-based naming if no folder name provided
             folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
