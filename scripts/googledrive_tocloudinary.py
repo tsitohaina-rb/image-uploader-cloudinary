@@ -622,6 +622,94 @@ def load_previous_progress(folder_id):
         logging.warning(f"Could not load progress from {latest_file}: {e}")
         return None
 
+def check_cloudinary_folder_exists(folder_name):
+    """
+    Check if a folder exists in Cloudinary by searching for resources with that folder prefix.
+    
+    Args:
+        folder_name (str): The folder name to check
+        
+    Returns:
+        tuple: (exists, resource_count, sample_urls)
+    """
+    try:
+        import cloudinary.api
+        
+        # Search for resources with the folder prefix
+        result = cloudinary.api.resources(
+            type="upload",
+            prefix=f"{folder_name}/",
+            max_results=10  # Just need to know if any exist
+        )
+        
+        resources = result.get('resources', [])
+        exists = len(resources) > 0
+        sample_urls = [res['secure_url'] for res in resources[:3]]  # Show up to 3 samples
+        
+        return exists, len(resources), sample_urls
+        
+    except Exception as e:
+        print(f"Warning: Could not check Cloudinary folder existence: {e}")
+        return False, 0, []
+
+def prompt_folder_action(folder_name, resource_count, sample_urls):
+    """
+    Prompt user for action when folder already exists in Cloudinary.
+    
+    Args:
+        folder_name (str): The existing folder name
+        resource_count (int): Number of existing resources
+        sample_urls (list): Sample URLs from existing folder
+        
+    Returns:
+        tuple: (action, new_folder_name) where action is 'merge', 'rename', or 'cancel'
+    """
+    print(f"\n⚠️  Folder '{folder_name}' already exists in Cloudinary!")
+    print(f"   📊 Contains {resource_count} existing images")
+    
+    if sample_urls:
+        print(f"   🖼️  Sample images:")
+        for i, url in enumerate(sample_urls[:3], 1):
+            filename = url.split('/')[-1]
+            print(f"      {i}. {filename}")
+        if resource_count > 3:
+            print(f"      ... and {resource_count - 3} more")
+    
+    print(f"\n🤔 What would you like to do?")
+    print(f"   1. MERGE - Add new images to existing folder (skip duplicates)")
+    print(f"   2. RENAME - Use a different folder name")
+    print(f"   3. CANCEL - Stop the upload")
+    
+    while True:
+        choice = input("\nEnter your choice (1/2/3): ").strip()
+        
+        if choice == '1':
+            print(f"✅ Will merge with existing folder '{folder_name}'")
+            return 'merge', folder_name
+        elif choice == '2':
+            while True:
+                new_name = input(f"\n📝 Enter new folder name: ").strip()
+                if new_name:
+                    # Check if the new name also exists
+                    exists, count, urls = check_cloudinary_folder_exists(new_name)
+                    if exists:
+                        print(f"⚠️  Folder '{new_name}' also exists ({count} images)")
+                        retry = input("Try a different name? (y/n): ").strip().lower()
+                        if retry == 'y':
+                            continue
+                        else:
+                            return 'merge', new_name
+                    else:
+                        print(f"✅ Will use new folder name '{new_name}'")
+                        return 'rename', new_name
+                else:
+                    print("❌ Folder name cannot be empty")
+        elif choice == '3':
+            print("❌ Upload cancelled")
+            return 'cancel', None
+        else:
+            print("❌ Invalid choice. Please enter 1, 2, or 3")
+
 def sanitize_cloudinary_public_id(text):
     """
     Sanitize text for use in Cloudinary public_id.
@@ -629,6 +717,12 @@ def sanitize_cloudinary_public_id(text):
     """
     if not text:
         return text
+    
+    # First, handle accents by converting to ASCII equivalents
+    import unicodedata
+    # Normalize and convert accented characters to ASCII
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(c for c in text if not unicodedata.combining(c))
     
     # Replace problematic characters
     # & becomes 'and'
@@ -641,6 +735,10 @@ def sanitize_cloudinary_public_id(text):
     text = re.sub(r'_+', '_', text)
     # Remove leading/trailing underscores and slashes
     text = text.strip('_/')
+    
+    # Ensure we don't return empty string
+    if not text:
+        text = "uploaded_files"
     
     return text
 
@@ -699,6 +797,10 @@ def process_worker_upload(args):
         
         # Sanitize folder name for Cloudinary
         cloudinary_folder = sanitize_cloudinary_public_id(base_folder_name.strip())
+        
+        # Ensure we have a valid folder name
+        if not cloudinary_folder:
+            cloudinary_folder = "uploaded_files"  # Fallback folder name
         
         # Get file permissions and download URL
         try:
@@ -1507,6 +1609,31 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
             folder_name = f"gdrive_folder_{folder_id}"
     else:
         folder_name = folder_name.strip()  # Also trim user-provided folder names
+    
+    # Ensure folder_name is not None
+    if not folder_name:
+        folder_name = f"gdrive_folder_{folder_id}"
+    
+    # Check if folder already exists in Cloudinary and get user preference
+    print(f"🔍 Checking if folder '{folder_name}' exists in Cloudinary...")
+    exists, resource_count, sample_urls = check_cloudinary_folder_exists(folder_name)
+    
+    if exists:
+        action, final_folder_name = prompt_folder_action(folder_name, resource_count, sample_urls)
+        
+        if action == 'cancel':
+            print("Upload cancelled by user")
+            return
+        elif action == 'rename':
+            folder_name = final_folder_name or f"gdrive_folder_{folder_id}"
+            print(f"📂 Using folder name: '{folder_name}'")
+        elif action == 'merge':
+            print(f"📂 Merging with existing folder: '{folder_name}'")
+    else:
+        print(f"✅ Folder '{folder_name}' does not exist - will be created")
+        print(f"📁 New folder will be created at: /cloudinary/{folder_name}/")
+    
+    print()  # Add spacing before next section
     
     # Get all images from Google Drive folder (with recursive scanning)
     print(f"Scanning Google Drive folder: {folder_name} (ID: {folder_id})")
