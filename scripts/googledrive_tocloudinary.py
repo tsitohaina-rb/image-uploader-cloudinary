@@ -38,6 +38,9 @@ from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import cloudinary
 import cloudinary.uploader
+from PIL import Image, ImageOps
+import tempfile
+import io
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -646,6 +649,191 @@ def get_file_download_url(service, file_id, filename):
         download_url = f"https://drive.google.com/uc?id={file_id}&export=download"
         logging.info(f"  Using fallback URL for: {filename}")
         return download_url
+
+@retry_with_backoff(max_retries=2, backoff_factor=1, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, Exception))
+def get_file_size_from_gdrive(service, file_id, filename):
+    """
+    Get file size from Google Drive file metadata - optimized for speed.
+    
+    Args:
+        service: Google Drive service instance
+        file_id (str): Google Drive file ID
+        filename (str): Filename for logging
+        
+    Returns:
+        int: File size in bytes, or 0 if size cannot be determined
+    """
+    try:
+        # Request only size field for faster response
+        file_metadata = service.files().get(
+            fileId=file_id, 
+            fields='size',  # Only request size field for speed
+            supportsAllDrives=True
+        ).execute()
+        
+        # Try 'size' field first (available for most files)
+        if 'size' in file_metadata:
+            size_bytes = int(file_metadata['size'])
+            size_mb = size_bytes / (1024 * 1024)
+            
+            # Only log if file is large (>10MB) to reduce log noise
+            if size_mb > 10:
+                logging.info(f"  File size: {filename} = {size_mb:.2f} MB")
+            return size_bytes
+        
+        else:
+            # If size not available, assume it's small (Google Docs, etc.)
+            logging.debug(f"  File size unavailable for: {filename} (likely a Google Doc/Sheet)")
+            return 0
+            
+    except Exception as e:
+        logging.warning(f"  Could not get file size for {filename}: {e}")
+        return 0
+
+def compress_image_for_cloudinary(image_data, filename, max_size_mb=19, quality_start=85):
+    """
+    Compress image data to be under Cloudinary's 20MB limit with a small safety margin.
+    
+    Args:
+        image_data (bytes): Original image data
+        filename (str): Filename for logging
+        max_size_mb (int): Maximum size in MB (default: 19MB for small safety margin)
+        quality_start (int): Starting JPEG quality (default: 85)
+        
+    Returns:
+        tuple: (compressed_data, was_compressed, final_size_mb, compression_ratio)
+    """
+    try:
+        original_size = len(image_data)
+        original_size_mb = original_size / (1024 * 1024)
+        max_size_bytes = max_size_mb * 1024 * 1024
+        
+        # If already under limit, return as-is
+        if original_size <= max_size_bytes:
+            logging.info(f"  Image {filename} is {original_size_mb:.2f} MB - no compression needed")
+            return image_data, False, original_size_mb, 1.0
+        
+        logging.info(f"  Compressing {filename}: {original_size_mb:.2f} MB -> target: <{max_size_mb} MB")
+        
+        # Open image with PIL
+        image = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if necessary (for JPEG)
+        if image.mode in ('RGBA', 'P', 'LA'):
+            # Create white background for transparency
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            if image.mode == 'P':
+                image = image.convert('RGBA')
+            background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+            image = background
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Apply orientation from EXIF if present
+        try:
+            image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass  # Continue if EXIF processing fails
+        
+        # Progressive compression with quality reduction
+        current_quality = quality_start
+        min_quality = 30  # Minimum acceptable quality
+        quality_step = 10
+        
+        best_data = None
+        best_size = float('inf')
+        
+        while current_quality >= min_quality:
+            # Create compressed version
+            output = io.BytesIO()
+            
+            # Save as progressive JPEG for better compression
+            image.save(output, 
+                      format='JPEG',
+                      quality=current_quality,
+                      optimize=True,
+                      progressive=True)
+            
+            compressed_data = output.getvalue()
+            compressed_size = len(compressed_data)
+            
+            if compressed_size <= max_size_bytes:
+                # Found acceptable compression
+                final_size_mb = compressed_size / (1024 * 1024)
+                compression_ratio = compressed_size / original_size
+                
+                logging.info(f"  Compression successful: {filename}")
+                logging.info(f"    Original: {original_size_mb:.2f} MB")
+                logging.info(f"    Compressed: {final_size_mb:.2f} MB (quality: {current_quality})")
+                logging.info(f"    Compression ratio: {compression_ratio:.2f} ({(1-compression_ratio)*100:.1f}% reduction)")
+                
+                return compressed_data, True, final_size_mb, compression_ratio
+            
+            # Track best result so far
+            if compressed_size < best_size:
+                best_data = compressed_data
+                best_size = compressed_size
+            
+            current_quality -= quality_step
+        
+        # If we couldn't get under the limit, try dimension reduction
+        if best_size > max_size_bytes:
+            logging.warning(f"  Quality reduction insufficient for {filename}, trying dimension reduction...")
+            
+            # Try reducing dimensions by 20% each iteration
+            scale_factor = 0.8
+            current_image = image.copy()
+            
+            for attempt in range(3):  # Max 3 attempts at dimension reduction
+                new_width = int(current_image.width * scale_factor)
+                new_height = int(current_image.height * scale_factor)
+                
+                if new_width < 100 or new_height < 100:
+                    break  # Don't make image too small
+                
+                resized_image = current_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                
+                output = io.BytesIO()
+                resized_image.save(output,
+                                 format='JPEG',
+                                 quality=70,  # Use reasonable quality for resized image
+                                 optimize=True,
+                                 progressive=True)
+                
+                compressed_data = output.getvalue()
+                compressed_size = len(compressed_data)
+                
+                if compressed_size <= max_size_bytes:
+                    final_size_mb = compressed_size / (1024 * 1024)
+                    compression_ratio = compressed_size / original_size
+                    
+                    logging.info(f"  Compression with resizing successful: {filename}")
+                    logging.info(f"    Original: {original_size_mb:.2f} MB ({image.width}x{image.height})")
+                    logging.info(f"    Compressed: {final_size_mb:.2f} MB ({new_width}x{new_height}, quality: 70)")
+                    logging.info(f"    Compression ratio: {compression_ratio:.2f} ({(1-compression_ratio)*100:.1f}% reduction)")
+                    
+                    return compressed_data, True, final_size_mb, compression_ratio
+                
+                current_image = resized_image
+        
+        # Last resort: return best attempt even if still over limit
+        if best_data:
+            final_size_mb = best_size / (1024 * 1024)
+            compression_ratio = best_size / original_size
+            
+            logging.warning(f"  Could not compress {filename} below {max_size_mb}MB limit")
+            logging.warning(f"    Best result: {final_size_mb:.2f} MB (compression: {compression_ratio:.2f})")
+            logging.warning(f"    This may fail at Cloudinary upload - consider manual compression")
+            
+            return best_data, True, final_size_mb, compression_ratio
+        
+        # If all else fails, return original
+        logging.error(f"  Compression failed for {filename}, returning original")
+        return image_data, False, original_size_mb, 1.0
+        
+    except Exception as e:
+        logging.error(f"  Error compressing {filename}: {e}")
+        return image_data, False, len(image_data) / (1024 * 1024), 1.0
 
 def save_progress(progress_counter, folder_id, folder_name, total_files, timestamp):
     """
@@ -1448,7 +1636,11 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             logging.warning(f"  Could not manage permissions for {filename}: {perm_error}")
             public_permission_id = None
             
-        # 2) Get the download URL
+        # 2) Check file size and get download URL
+        logging.info(f"  Checking file size: {filename}")
+        file_size_bytes = get_file_size_from_gdrive(service, file_id, filename)
+        file_size_mb = file_size_bytes / (1024 * 1024) if file_size_bytes > 0 else 0
+        
         logging.info(f"  Getting download URL: {filename}")
         
         try:
@@ -1458,6 +1650,45 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             download_url = f"https://drive.google.com/uc?id={file_id}&export=download"
             logging.info(f"  Using fallback URL for: {filename}")
 
+        # 3) Check if compression is needed (file > 20MB - Cloudinary's actual limit)
+        needs_compression = file_size_mb > 20.0
+        upload_source = download_url  # Default: use direct URL
+        compressed_data = None
+        compression_info = {}
+        
+        if needs_compression:
+            logging.info(f"  File {filename} ({file_size_mb:.2f} MB) exceeds Cloudinary's 20MB limit - compression required")
+            
+            try:
+                # Download file data for compression
+                logging.info(f"  Downloading {filename} for compression...")
+                session = get_thread_session()
+                response = session.get(download_url, timeout=120)
+                response.raise_for_status()
+                
+                original_data = response.content
+                logging.info(f"  Downloaded {len(original_data):,} bytes for compression")
+                
+                # Compress the image
+                compressed_data, was_compressed, final_size_mb, compression_ratio = compress_image_for_cloudinary(
+                    original_data, filename
+                )
+                
+                if was_compressed:
+                    compression_info = {
+                        'original_size_mb': file_size_mb,
+                        'compressed_size_mb': final_size_mb,
+                        'compression_ratio': compression_ratio
+                    }
+                    logging.info(f"  Will upload compressed version: {final_size_mb:.2f} MB")
+                else:
+                    logging.warning(f"  Compression failed, will attempt original upload")
+                    compressed_data = None
+                    
+            except Exception as compression_error:
+                logging.error(f"  Compression process failed for {filename}: {compression_error}")
+                compressed_data = None
+
         # 3) Derive filename / extension for Cloudinary options
         file_stem, ext = os.path.splitext(filename)
         # Clean the file stem to avoid whitespace issues
@@ -1465,24 +1696,46 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         original_extension = ext.lower().replace('.', '') if ext else 'jpg'
         logging.info(f"  Uploading to Cloudinary as: {file_stem}.{original_extension}")
 
-        # 4) Cloudinary pulls the file directly from Google Drive with enhanced error handling
+        # 4) Upload to Cloudinary (using compressed data if available)
         try:
             # Combine folder path and filename for the complete public_id
             complete_public_id = f"{cloudinary_folder}/{file_stem}"
             
-            response = cloudinary.uploader.upload(
-                download_url,
-                public_id=complete_public_id,   # use complete path as public_id
-                use_filename=False,             # don't use remote URL name
-                unique_filename=False,          # keep stable public_id
-                overwrite=True,                 # allow re-runs to overwrite
-                format=original_extension,      # keep original extension
-                resource_type="image",          # or "auto" if you might have videos/svg/others
-                timeout=120                     # Extended timeout for Cloudinary
-            )
+            # Use compressed data if available, otherwise use direct URL
+            if compressed_data:
+                logging.info(f"  Uploading compressed image data to Cloudinary...")
+                
+                # Create a BytesIO object for uploading binary data
+                upload_source = io.BytesIO(compressed_data)
+                upload_kwargs = {
+                    'public_id': complete_public_id,
+                    'use_filename': False,
+                    'unique_filename': False,
+                    'overwrite': True,
+                    'format': 'jpg',  # Compressed images are always JPEG
+                    'resource_type': "image",
+                    'timeout': 120
+                }
+            else:
+                logging.info(f"  Uploading via direct URL to Cloudinary...")
+                upload_source = download_url
+                upload_kwargs = {
+                    'public_id': complete_public_id,
+                    'use_filename': False,
+                    'unique_filename': False,
+                    'overwrite': True,
+                    'format': original_extension,
+                    'resource_type': "image",
+                    'timeout': 120
+                }
+            
+            response = cloudinary.uploader.upload(upload_source, **upload_kwargs)
+            
         except Exception as cloudinary_error:
             # If Cloudinary upload fails, add extra context
             error_msg = f"Cloudinary upload failed: {str(cloudinary_error)}"
+            if compressed_data:
+                error_msg += f" (compressed from {file_size_mb:.2f} MB)"
             logging.error(f"[Thread {thread_id}] {error_msg}")
             raise Exception(error_msg)
 
@@ -1494,6 +1747,13 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             'filename': filename,
             'folder_path': folder_path
         }
+        
+        # Add compression info to result if compression was used
+        if compressed_data and compression_info:
+            result['compression_info'] = compression_info
+            result['was_compressed'] = True
+        else:
+            result['was_compressed'] = False
         
         # Add JPG URL for successful upload
         original_url = response['secure_url']
@@ -1512,7 +1772,12 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         with progress_lock:
             progress_counter['uploaded'] += 1
             current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
-            logging.info(f"SUCCESS: {filename} -> {result['cloudinary_url']}")
+            
+            # Enhanced success logging with compression info
+            success_msg = f"SUCCESS: {filename} -> {result['cloudinary_url']}"
+            if result.get('was_compressed', False) and compression_info:
+                success_msg += f" [COMPRESSED: {compression_info['original_size_mb']:.2f}MB → {compression_info['compressed_size_mb']:.2f}MB ({compression_info['compression_ratio']:.2f}x)]"
+            logging.info(success_msg)
             
             # Real-time progress logging every 10 files or at completion
             if current % 10 == 0 or current == progress_counter['total']:
@@ -2242,10 +2507,18 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
                 writer.writeheader()
                 writer.writerows(results)
             
-            # Count conversions for statistics
+            # Count conversions and compression for statistics
             png_conversions = sum(1 for result in results 
                                 if result.get('status') == 'success' 
                                 and result.get('cloudinary_url') != result.get('jpg_url'))
+            
+            compressed_files = sum(1 for result in results if result.get('was_compressed', False))
+            total_size_saved = 0
+            for result in results:
+                if result.get('was_compressed', False) and result.get('compression_info'):
+                    comp_info = result['compression_info']
+                    size_saved = comp_info['original_size_mb'] - comp_info['compressed_size_mb']
+                    total_size_saved += size_saved
             
             successful = stats_by_status['success']
             failed = stats_by_status['failed']
@@ -2268,6 +2541,9 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
             logging.info(f"  Previously uploaded (skipped): {skipped}")
             logging.info(f"  Failed uploads: {failed}")
             logging.info(f"  PNG to JPG conversions: {png_conversions}")
+            if compressed_files > 0:
+                logging.info(f"  Images compressed for Cloudinary: {compressed_files}")
+                logging.info(f"  Total size saved by compression: {total_size_saved:.2f} MB")
             logging.info(f"  Recursive scanning: {recursive}")
             logging.info(f"  Total folders processed: {len(stats_by_folder)}")
             logging.info("")
@@ -2296,6 +2572,9 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
             if png_conversions > 0:
                 print(f"  🔄 PNG to JPG conversions: {png_conversions}")
                 print(f"  💡 Use 'jpg_url' column for optimal JPG format")
+            if compressed_files > 0:
+                print(f"  🗜️  Images compressed: {compressed_files} (saved {total_size_saved:.2f} MB)")
+                print(f"  💡 Large files automatically compressed for Cloudinary compatibility")
             
             # Show detailed folder organization summary
             if len(stats_by_folder) > 1:  # Only show if multiple folders
@@ -2552,6 +2831,12 @@ if __name__ == "__main__":
         print("  ✓ Progress updates every 10 files in both console and log file")
         print("  ✓ Detailed per-folder statistics logged throughout operation")
         print("  ✓ Log files saved in data/log/ with timestamps")
+        print("\nAutomatic Image Compression:")
+        print("  ✓ Files larger than 20MB automatically compressed for Cloudinary")
+        print("  ✓ Fast size checking via Google Drive API metadata")
+        print("  ✓ Progressive JPEG compression with quality optimization")
+        print("  ✓ Dimension reduction if quality reduction insufficient")
+        print("  ✓ Compression details logged for each processed file")
         print("\nFailed Upload Handling:")
         print("  ✓ Detailed list of failed uploads shown at completion")
         print("  ✓ Interactive retry option for failed uploads")
