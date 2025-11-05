@@ -1,3 +1,19 @@
+"""
+Google Drive to Cloudinary Upload Script
+========================================
+
+Cross-platform compatible script for uploading images from Google Drive to Cloudinary.
+Supports Windows, Linux, and macOS with:
+- SSL-safe multiprocessing using ProcessPoolExecutor
+- Cross-platform file paths with pathlib
+- Platform-specific file locking (fcntl for Unix, msvcrt for Windows)
+- Cloudinary folder management with user prompts
+- Comprehensive caching and resume capabilities
+
+Author: Tsitohaina
+Date: November 2024
+"""
+
 import os
 import csv
 import sys
@@ -12,8 +28,9 @@ import gc
 import urllib.parse
 import glob
 import multiprocessing
-import fcntl
 import pickle
+import platform
+import unicodedata
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,27 +46,78 @@ from pathlib import Path
 from threading import Lock
 from dotenv import load_dotenv
 import time
-from datetime import datetime
-import pickle
 
-# Setup directory structure
-DATA_DIR = 'data'
-CACHE_DIR = os.path.join(DATA_DIR, 'cache')
-LOG_DIR = os.path.join(DATA_DIR, 'log')
-OUTPUT_DIR = os.path.join(DATA_DIR, 'output')
+# Cross-platform file locking
+try:
+    import fcntl  # Unix/Linux/macOS
+    HAS_FCNTL = True
+except ImportError:
+    try:
+        import msvcrt  # Windows
+        HAS_FCNTL = False
+    except ImportError:
+        HAS_FCNTL = None
+
+def lock_file(file_handle):
+    """Cross-platform file locking"""
+    if HAS_FCNTL:
+        # Unix/Linux/macOS
+        import fcntl
+        fcntl.flock(file_handle.fileno(), fcntl.LOCK_EX)
+    elif HAS_FCNTL is False:
+        # Windows
+        try:
+            import msvcrt
+            # Use blocking lock (1 = LK_LOCK equivalent)
+            msvcrt.locking(file_handle.fileno(), 1, 1)
+        except (ImportError, AttributeError, OSError):
+            pass  # File locking not critical for this application
+    # If neither works, continue without locking (not ideal but functional)
+
+def unlock_file(file_handle):
+    """Cross-platform file unlocking"""
+    if HAS_FCNTL:
+        # Unix/Linux/macOS
+        import fcntl
+        fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
+    elif HAS_FCNTL is False:
+        # Windows
+        try:
+            import msvcrt
+            # Use unlock (0 = LK_UNLCK equivalent)
+            msvcrt.locking(file_handle.fileno(), 0, 1)
+        except (ImportError, AttributeError, OSError):
+            pass  # Unlocking not critical
+    # If neither works, no unlocking needed
+
+def get_platform_info():
+    """Get platform information for debugging"""
+    return {
+        'system': platform.system(),
+        'platform': platform.platform(),
+        'python_version': platform.python_version(),
+        'architecture': platform.architecture()[0],
+        'file_locking': 'fcntl' if HAS_FCNTL else 'msvcrt' if HAS_FCNTL is False else 'none'
+    }
+
+# Setup directory structure - Use pathlib for cross-platform compatibility
+DATA_DIR = Path('data')
+CACHE_DIR = DATA_DIR / 'cache'
+LOG_DIR = DATA_DIR / 'log'
+OUTPUT_DIR = DATA_DIR / 'output'
+
+# Create necessary directories
+for directory in [CACHE_DIR, LOG_DIR, OUTPUT_DIR]:
+    directory.mkdir(parents=True, exist_ok=True)
 
 # Add parent directory to path to import config
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(str(Path(__file__).parent.parent))
 try:
     from config import USE_FILENAME, UNIQUE_FILENAME
 except ImportError:
     # If config import fails, use default values
     USE_FILENAME = True
     UNIQUE_FILENAME = False
-
-# Create necessary directories
-for directory in [CACHE_DIR, LOG_DIR, OUTPUT_DIR]:
-    os.makedirs(directory, exist_ok=True)
 
 # Set socket timeout globally to 60 seconds (increased for better stability)
 socket.setdefaulttimeout(60)
@@ -153,17 +221,17 @@ def setup_logging(folder_name):
     # Sanitize folder name for filename (replace problematic characters)
     safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_')
     
-    log_filename = os.path.join(LOG_DIR, f'{safe_folder_name}_{timestamp}.log')
+    log_filename = LOG_DIR / f'{safe_folder_name}_{timestamp}.log'
     
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_filename),
+            logging.FileHandler(str(log_filename)),
             logging.StreamHandler()  # Also print to console
         ]
     )
-    return log_filename
+    return str(log_filename)
 
 def is_cloudinary_url(url):
     """Check if a URL is a Cloudinary URL"""
@@ -363,22 +431,22 @@ class UploadCache:
             safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
             
             # Look for existing cache files first
-            cache_pattern = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_*.json')
+            cache_pattern = str(CACHE_DIR / f'gdrive_upload_cache_{safe_folder_name}_*.json')
             existing_caches = glob.glob(cache_pattern)
             
             if existing_caches:
                 # Use the most recent existing cache file
-                self.cache_file = max(existing_caches, key=os.path.getctime)
-                print(f"🔄 RESUMING: Found existing cache file: {os.path.basename(self.cache_file)}")
+                self.cache_file = Path(max(existing_caches, key=os.path.getctime))
+                print(f"🔄 RESUMING: Found existing cache file: {self.cache_file.name}")
             else:
                 # Create new cache file with current timestamp
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json')
-                print(f"🆕 STARTING: Creating new cache file: {os.path.basename(self.cache_file)}")
+                self.cache_file = CACHE_DIR / f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json'
+                print(f"🆕 STARTING: Creating new cache file: {self.cache_file.name}")
         else:
             # Fallback to hash-based naming if no folder name provided
             folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
-            self.cache_file = os.path.join(CACHE_DIR, f'gdrive_upload_cache_{folder_hash}.json')
+            self.cache_file = CACHE_DIR / f'gdrive_upload_cache_{folder_hash}.json'
         
         self.lock = Lock()
         self.cache = self._load_cache()
@@ -386,7 +454,7 @@ class UploadCache:
     def _load_cache(self) -> dict:
         """Load the cache from file"""
         try:
-            if os.path.exists(self.cache_file):
+            if self.cache_file.exists():
                 with open(self.cache_file, 'r') as f:
                     return json.load(f)
         except Exception as e:
@@ -448,10 +516,10 @@ class UploadCache:
 def authenticate_google_drive():
     """Authenticate and return Google Drive service"""
     creds = None
-    token_file = os.path.join(CACHE_DIR, 'token.pickle')
+    token_file = CACHE_DIR / 'token.pickle'
     
     # The file token.pickle stores the user's access and refresh tokens.
-    if os.path.exists(token_file):
+    if token_file.exists():
         with open(token_file, 'rb') as token:
             creds = pickle.load(token)
     
@@ -575,7 +643,7 @@ def save_progress(progress_counter, folder_id, folder_name, total_files, timesta
     """
     Save current progress to a JSON file for resuming interrupted uploads.
     """
-    progress_file = os.path.join(CACHE_DIR, f'progress_{folder_id}_{timestamp}.json')
+    progress_file = CACHE_DIR / f'progress_{folder_id}_{timestamp}.json'
     
     try:
         progress_data = {
@@ -601,7 +669,7 @@ def load_previous_progress(folder_id):
     """
     Load previous progress if available.
     """
-    progress_pattern = os.path.join(CACHE_DIR, f'progress_{folder_id}_*.json')
+    progress_pattern = str(CACHE_DIR / f'progress_{folder_id}_*.json')
     import glob
     
     progress_files = glob.glob(progress_pattern)
@@ -761,9 +829,9 @@ def process_worker_upload(args):
         
         # Re-authenticate Google Drive in worker process
         creds = None
-        token_file = os.path.join('data/cache', 'token.pickle')
+        token_file = Path('data/cache') / 'token.pickle'
         
-        if os.path.exists(token_file):
+        if token_file.exists():
             with open(token_file, 'rb') as token:
                 creds = pickle.load(token)
         
@@ -857,33 +925,36 @@ def process_worker_upload(args):
                     if os.path.exists(cache_file):
                         with open(cache_file, 'r+') as f:
                             # Lock the entire file for exclusive access
-                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                            lock_file(f)
                             
-                            # Read current data
-                            f.seek(0)
                             try:
-                                cache_data = json.load(f)
-                            except json.JSONDecodeError:
-                                # File is corrupted, start fresh
-                                cache_data = {
-                                    'successful_uploads': {},
-                                    'failed_uploads': {},
-                                    'last_run': datetime.now().isoformat()
-                                }
-                            
-                            # Ensure structure exists
-                            if 'successful_uploads' not in cache_data:
-                                cache_data['successful_uploads'] = {}
-                            
-                            # Update with new data
-                            cache_data['successful_uploads'][file_id] = success_data
-                            cache_data['last_run'] = datetime.now().isoformat()
-                            
-                            # Write back atomically
-                            f.seek(0)
-                            json.dump(cache_data, f, indent=2)
-                            f.truncate()
-                            break  # Success, exit retry loop
+                                # Read current data
+                                f.seek(0)
+                                try:
+                                    cache_data = json.load(f)
+                                except json.JSONDecodeError:
+                                    # File is corrupted, start fresh
+                                    cache_data = {
+                                        'successful_uploads': {},
+                                        'failed_uploads': {},
+                                        'last_run': datetime.now().isoformat()
+                                    }
+                                
+                                # Ensure structure exists
+                                if 'successful_uploads' not in cache_data:
+                                    cache_data['successful_uploads'] = {}
+                                
+                                # Update with new data
+                                cache_data['successful_uploads'][file_id] = success_data
+                                cache_data['last_run'] = datetime.now().isoformat()
+                                
+                                # Write back atomically
+                                f.seek(0)
+                                json.dump(cache_data, f, indent=2)
+                                f.truncate()
+                                break  # Success, exit retry loop
+                            finally:
+                                unlock_file(f)
                     else:
                         # Create new file with proper locking
                         # Use a temporary file to ensure atomic creation
@@ -895,8 +966,11 @@ def process_worker_upload(args):
                         }
                         
                         with open(temp_cache_file, 'w') as f:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                            json.dump(cache_data, f, indent=2)
+                            lock_file(f)
+                            try:
+                                json.dump(cache_data, f, indent=2)
+                            finally:
+                                unlock_file(f)
                         
                         # Atomic rename
                         os.rename(temp_cache_file, cache_file)
@@ -1679,7 +1753,7 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     # Sanitize folder name for CSV filename (same as done for log filename)
     safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
     
-    output_csv = os.path.join(OUTPUT_DIR, f"{safe_folder_name}_{timestamp}.csv")
+    output_csv = OUTPUT_DIR / f"{safe_folder_name}_{timestamp}.csv"
     
     # Initialize upload cache
     cache = UploadCache(folder_id, folder_name)
