@@ -700,7 +700,7 @@ def load_previous_progress(folder_id):
 
 def check_cloudinary_folder_exists(folder_name):
     """
-    Check if a folder exists in Cloudinary by searching for resources with that folder prefix.
+    Check if a folder exists in Cloudinary using the fast folders API.
     
     Args:
         folder_name (str): The folder name to check
@@ -711,22 +711,350 @@ def check_cloudinary_folder_exists(folder_name):
     try:
         import cloudinary.api
         
-        # Search for resources with the folder prefix
-        result = cloudinary.api.resources(
-            type="upload",
-            prefix=f"{folder_name}/",
-            max_results=10  # Just need to know if any exist
-        )
-        
-        resources = result.get('resources', [])
-        exists = len(resources) > 0
-        sample_urls = [res['secure_url'] for res in resources[:3]]  # Show up to 3 samples
-        
-        return exists, len(resources), sample_urls
+        # Use the fast folders API to check if folder exists
+        try:
+            # Get root level folders first
+            result = cloudinary.api.root_folders()
+            root_folders = result.get('folders', [])
+            
+            # Check if the folder name exists in root folders (case-insensitive exact match)
+            folder_name_lower = folder_name.lower()
+            for folder in root_folders:
+                if folder['name'].lower() == folder_name_lower:
+                    # Folder exists! Now get some sample resources for display
+                    try:
+                        resources_result = cloudinary.api.resources(
+                            type="upload",
+                            prefix=f"{folder['name']}/",
+                            max_results=10  # Just need to know how many exist
+                        )
+                        resources = resources_result.get('resources', [])
+                        sample_urls = [res['secure_url'] for res in resources[:3]]  # Show up to 3 samples
+                        return True, len(resources), sample_urls
+                    except:
+                        # Folder exists but maybe has no files or access issue
+                        return True, 0, []
+            
+            # Folder not found in root folders
+            return False, 0, []
+            
+        except Exception as e:
+            print(f"Warning: Could not use folders API, falling back to resource search: {e}")
+            # Fallback to old method if folders API fails
+            result = cloudinary.api.resources(
+                type="upload",
+                prefix=f"{folder_name}/",
+                max_results=10  # Just need to know if any exist
+            )
+            
+            resources = result.get('resources', [])
+            exists = len(resources) > 0
+            sample_urls = [res['secure_url'] for res in resources[:3]]  # Show up to 3 samples
+            
+            return exists, len(resources), sample_urls
         
     except Exception as e:
         print(f"Warning: Could not check Cloudinary folder existence: {e}")
         return False, 0, []
+
+def list_cloudinary_folders():
+    """
+    List all folders in Cloudinary using the efficient folders API.
+    
+    Returns:
+        dict: Dictionary with folder information
+    """
+    try:
+        import cloudinary.api
+        
+        print("📊 Scanning Cloudinary for existing folders...")
+        
+        # Use the folders API for much faster folder listing
+        all_folders = {}
+        
+        try:
+            # Get root level folders first
+            result = cloudinary.api.root_folders()
+            root_folders = result.get('folders', [])
+            
+            print(f"✅ Found {len(root_folders)} root-level folders")
+            
+            # Just store root folder info without any recursive processing
+            for folder in root_folders:
+                folder_name = folder['name']
+                all_folders[folder_name] = {
+                    'file_count': 0,  # Don't count files for speed
+                    'created_at': folder.get('created_at', ''),
+                    'last_updated': folder.get('created_at', '')
+                }
+            
+            # Also check for resources in the root (no folder) - skip for speed
+            # We'll just show folders, not count root files
+            
+        except Exception as e:
+            print(f"Warning: Could not use folders API, falling back to resource scanning: {e}")
+            # Fallback to the old method if folders API fails
+            return list_cloudinary_folders_legacy()
+        
+        print(f"📁 Found {len(all_folders)} folders in Cloudinary")
+        print()
+        
+        # Display results
+        if all_folders:
+            print("📋 Cloudinary Folder Structure:")
+            print("=" * 80)
+            
+            # Sort folders for better display (root first, then alphabetically)
+            # Sort folders alphabetically
+            sorted_folders = sorted(all_folders.items())
+            
+            for folder_path, info in sorted_folders:
+                created_date = info["created_at"][:10] if info["created_at"] else "Unknown"
+                print(f"📂 {folder_path:60} │ Created: {created_date}")
+            
+            print("=" * 80)
+            print(f"💡 Total: {len(all_folders)} folders")
+            print("💡 Use 'upload' command with any of these folder names to add more images")            
+        else:
+            print("📭 No folders found in Cloudinary (account appears to be empty)")
+            print("💡 Upload some images first using the 'upload' command")
+        
+        return all_folders
+        
+    except Exception as e:
+        print(f"❌ Error accessing Cloudinary: {e}")
+        print("💡 Please check your Cloudinary configuration in .env file")
+        return {}
+
+def list_cloudinary_folders_legacy():
+    """
+    Legacy method: List all folders by analyzing all resources (slower but comprehensive).
+    Used as fallback when folders API is not available.
+    
+    Returns:
+        dict: Dictionary with folder information
+    """
+    try:
+        import cloudinary.api
+        
+        print("📊 Using legacy method: Scanning all Cloudinary resources...")
+        
+        # Get all resources to analyze folder structure
+        all_folders = {}
+        next_cursor = None
+        total_resources = 0
+        
+        while True:
+            try:
+                # Get resources in batches
+                if next_cursor:
+                    result = cloudinary.api.resources(
+                        type="upload",
+                        resource_type="image",
+                        max_results=500,  # Maximum allowed per request
+                        next_cursor=next_cursor
+                    )
+                else:
+                    result = cloudinary.api.resources(
+                        type="upload", 
+                        resource_type="image",
+                        max_results=500
+                    )
+                
+                resources = result.get('resources', [])
+                total_resources += len(resources)
+                
+                # Analyze each resource for folder structure
+                for resource in resources:
+                    public_id = resource.get('public_id', '')
+                    
+                    # Extract folder path from public_id
+                    if '/' in public_id:
+                        # Split the public_id to get folder parts
+                        parts = public_id.split('/')
+                        filename = parts[-1]  # Last part is the filename
+                        folder_parts = parts[:-1]  # All parts except the last
+                        
+                        # Build folder hierarchy
+                        current_path = ""
+                        for i, part in enumerate(folder_parts):
+                            if i == 0:
+                                current_path = part
+                            else:
+                                current_path = f"{current_path}/{part}"
+                            
+                            if current_path not in all_folders:
+                                all_folders[current_path] = {
+                                    'file_count': 0,
+                                    'created_at': resource.get('created_at', ''),
+                                    'last_updated': resource.get('created_at', '')
+                                }
+                            
+                            # Update folder info
+                            folder_info = all_folders[current_path]
+                            folder_info['file_count'] += 1
+                            
+                            # Update timestamps
+                            resource_date = resource.get('created_at', '')
+                            if resource_date:
+                                if not folder_info['created_at'] or resource_date < folder_info['created_at']:
+                                    folder_info['created_at'] = resource_date
+                                if not folder_info['last_updated'] or resource_date > folder_info['last_updated']:
+                                    folder_info['last_updated'] = resource_date
+                    else:
+                        # File in root directory
+                        root_key = "(root)"
+                        if root_key not in all_folders:
+                            all_folders[root_key] = {
+                                'file_count': 0,
+                                'created_at': resource.get('created_at', ''),
+                                'last_updated': resource.get('created_at', '')
+                            }
+                        
+                        folder_info = all_folders[root_key]
+                        folder_info['file_count'] += 1
+                
+                # Check if there are more resources
+                next_cursor = result.get('next_cursor')
+                if not next_cursor:
+                    break
+                    
+                # Progress update for large accounts
+                if total_resources % 1000 == 0:
+                    print(f"  Processed {total_resources} resources, found {len(all_folders)} folders...")
+                    
+            except Exception as e:
+                print(f"Error fetching resources: {e}")
+                break
+        
+        print(f"✅ Legacy scan complete: {total_resources} resources analyzed")
+        print(f"📁 Found {len(all_folders)} folders in Cloudinary")
+        print()
+        
+        # Display results
+        if all_folders:
+            print("📋 Cloudinary Folder Structure:")
+            print("=" * 80)
+            
+            # Sort folders for better display (root first, then alphabetically)
+            sorted_folders = sorted(all_folders.items(), key=lambda x: (x[0] != "(root)", x[0]))
+            
+            for folder_path, info in sorted_folders:
+                file_count = info['file_count']
+                created_at = info.get('created_at', '')
+                
+                # Format dates
+                try:
+                    from datetime import datetime
+                    if created_at:
+                        created_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        created_str = created_date.strftime('%Y-%m-%d %H:%M')
+                    else:
+                        created_str = "Unknown"
+                except:
+                    created_str = "Unknown"
+                
+                # Display folder info
+                if folder_path == "(root)":
+                    print(f"📁 {folder_path:<50} │ {file_count:>6} files │ Created: {created_str}")
+                else:
+                    # Calculate indentation based on folder depth
+                    depth = folder_path.count('/')
+                    indent = "  " * depth
+                    folder_name = folder_path.split('/')[-1]
+                    print(f"📁 {indent}{folder_name:<50} │ {file_count:>6} files │ Created: {created_str}")
+            
+            print("=" * 80)
+            print(f"💡 Total: {len(all_folders)} folders with {total_resources} images")
+            print("💡 Use 'upload' command with any of these folder names to add more images")
+            
+        else:
+            print("📭 No folders found in Cloudinary (account appears to be empty)")
+            print("💡 Upload some images first using the 'upload' command")
+        
+        return all_folders
+        
+    except Exception as e:
+        print(f"❌ Error accessing Cloudinary: {e}")
+        print("💡 Please check your Cloudinary configuration in .env file")
+        return {}
+
+def search_cloudinary_folder(search_term):
+    """
+    Search for specific folders in Cloudinary by name (case-insensitive, partial match).
+    Uses the fast folders API instead of scanning all resources.
+    
+    Args:
+        search_term (str): The folder name or part of folder name to search for
+        
+    Returns:
+        dict: Dictionary with matching folder information
+    """
+    try:
+        import cloudinary.api
+        
+        print(f"🔍 Searching Cloudinary for folders matching: '{search_term}'")
+        
+        # Use the fast folders API to get all root folders
+        all_folders = {}
+        
+        try:
+            # Get root level folders first
+            result = cloudinary.api.root_folders()
+            root_folders = result.get('folders', [])
+            
+            print(f"✅ Found {len(root_folders)} root-level folders to search")
+            
+            # Just store root folder info without any recursive processing
+            for folder in root_folders:
+                folder_name = folder['name']
+                all_folders[folder_name] = {
+                    'file_count': 0,  # Don't count files for speed
+                    'created_at': folder.get('created_at', ''),
+                    'last_updated': folder.get('created_at', '')
+                }
+            
+        except Exception as e:
+            print(f"Warning: Could not use folders API: {e}")
+            return {}
+        
+        # Filter folders that match the search term (case-insensitive, partial match)
+        search_term_lower = search_term.lower()
+        matching_folders = {}
+        
+        for folder_path, info in all_folders.items():
+            if search_term_lower in folder_path.lower():
+                matching_folders[folder_path] = info
+        
+        print(f"✅ Search complete: {len(all_folders)} folders scanned")
+        print()
+        
+        # Display results
+        if matching_folders:
+            print(f"🎯 Found {len(matching_folders)} folder(s) matching '{search_term}':")
+            print("=" * 80)
+            
+            # Sort folders alphabetically
+            sorted_folders = sorted(matching_folders.items())
+            
+            for folder_path, info in sorted_folders:
+                created_date = info['created_at'][:10] if info['created_at'] else 'Unknown'
+                print(f"📂 {folder_path:<50} │ Created: {created_date}")
+            
+            print("=" * 80)
+            print(f"💡 Found {len(matching_folders)} matching folders")
+            print("💡 Use any of these folder names with the 'upload' command to add more images")
+            
+        else:
+            print(f"📭 No folders found matching '{search_term}'")
+            print("💡 Try a different search term or use 'cloudinary' command to see all folders")
+        
+        return matching_folders
+        
+    except Exception as e:
+        print(f"❌ Error searching Cloudinary: {e}")
+        print("💡 Please check your Cloudinary configuration in .env file")
+        return {}
 
 def prompt_folder_action(folder_name, resource_count, sample_urls):
     """
@@ -809,7 +1137,7 @@ def sanitize_cloudinary_public_id(text):
     text = re.sub(r'[^a-zA-Z0-9\-_/]', '', text)
     # Clean up multiple consecutive underscores
     text = re.sub(r'_+', '_', text)
-    # Remove leading/trailing underscores and slashes
+    # Remove leading/trailing underscores and slashes, but preserve the content
     text = text.strip('_/')
     
     # Ensure we don't return empty string
@@ -834,6 +1162,13 @@ def process_worker_upload(args):
         from googleapiclient.http import MediaIoBaseDownload
         import io
         load_dotenv()
+        
+        # Configure Cloudinary in the worker process
+        cloudinary.config(
+            cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME'),
+            api_key=os.getenv('CLOUDINARY_API_KEY'),
+            api_secret=os.getenv('CLOUDINARY_API_SECRET')
+        )
         
         # Re-authenticate Google Drive in worker process
         creds = None
@@ -2030,11 +2365,15 @@ if __name__ == "__main__":
         print("  list                                    : List YOUR own folders in Google Drive")
         print("  shared                                  : List files and folders shared with you (individual shares)")
         print("  drives                                  : List Shared Drives (Team Drives) and their folders")
+        print("  cloudinary [--folder <name>]            : List all folders in Cloudinary or search for specific folder")
         print("  upload <folder_id_or_url> [options]     : Upload images from a Google Drive folder")
         print("\nExamples:")
-        print("  python googledrive_tocloudinary.py list      # Show your own folders")
-        print("  python googledrive_tocloudinary.py shared    # Show folders shared with you")
-        print("  python googledrive_tocloudinary.py drives    # Show Shared Drives (Team Drives)")
+        print("  python googledrive_tocloudinary.py list        # Show your own folders")
+        print("  python googledrive_tocloudinary.py shared      # Show folders shared with you")
+        print("  python googledrive_tocloudinary.py drives      # Show Shared Drives (Team Drives)")
+        print("  python googledrive_tocloudinary.py cloudinary  # Show existing Cloudinary folders")
+        print("  python googledrive_tocloudinary.py cloudinary --folder beauty  # Search for folders containing 'beauty'")
+        print("  python googledrive_tocloudinary.py cloudinary --folder=products # Search for folders containing 'products'")
         print("  # Using folder ID:")
         print("  python googledrive_tocloudinary.py upload 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs25kzpKiCkVyiE")
         print("  # Using Google Drive URL:")
@@ -2059,6 +2398,14 @@ if __name__ == "__main__":
         print("  ✓ You can specify custom destination folder name (2nd argument)")
         print("  ✓ Subfolders preserve structure: destination_name/subfolder1/subfolder2/image.jpg")
         print("  ✓ If no custom name provided, uses the original Google Drive folder name")
+        print("  ✓ Use 'cloudinary' command to see existing folders before uploading")
+        print("  ✓ Use 'cloudinary --folder <name>' to search for specific folders")
+        print("\nCloudinary Command Options:")
+        print("  cloudinary                    : List all folders in your Cloudinary account")
+        print("  cloudinary --folder beauty    : Search for folders containing 'beauty' (case-insensitive)")
+        print("  cloudinary --folder=products  : Alternative syntax for folder search")
+        print("  ✓ Search is case-insensitive and matches partial names")
+        print("  ✓ Useful for checking if a folder exists before uploading")
         print("\nReal-time Logging:")
         print("  ✓ Progress updates every 10 files in both console and log file")
         print("  ✓ Detailed per-folder statistics logged throughout operation")
@@ -2124,6 +2471,49 @@ if __name__ == "__main__":
         print("\n💡 Use any folder ID above with the 'upload' command")
         print("💡 Use 'drives' command to see Shared Drives (Team Drives)")
         print("💡 Use 'list' command to see your own folders")
+        
+    # Handle "cloudinary" command to show existing folders in Cloudinary
+    elif command == "cloudinary":
+        print("Testing Cloudinary configuration...")
+        is_configured, message = test_cloudinary_connection()
+        print(f"  {message}")
+        
+        if not is_configured:
+            print("\n⚠️  Please check your Cloudinary configuration in .env file")
+            sys.exit(1)
+        
+        print("  ✓ Cloudinary verified\n")
+        
+        # Check for --folder argument
+        search_term = None
+        if len(sys.argv) > 2:
+            args = sys.argv[2:]
+            i = 0
+            while i < len(args):
+                if args[i] == '--folder' and i + 1 < len(args):
+                    search_term = args[i + 1]
+                    break
+                elif args[i].startswith('--folder='):
+                    search_term = args[i].split('=', 1)[1]
+                    break
+                i += 1
+        
+        if search_term:
+            # Search for specific folder
+            folders = search_cloudinary_folder(search_term)
+        else:
+            # List all folders
+            folders = list_cloudinary_folders()
+        
+        if folders:
+            print("\n💡 Use any existing folder name with the 'upload' command to add more images")
+            print("💡 Use a new folder name with 'upload' command to create a new folder")
+        else:
+            if search_term:
+                print("\n💡 No matching folders found - try a different search term")
+            else:
+                print("\n💡 Your Cloudinary account appears to be empty")
+            print("💡 Use the 'upload' command to start uploading images from Google Drive")
         
     # Handle "drives" command to show only Shared Drives
     elif command == "drives":
@@ -2248,9 +2638,10 @@ if __name__ == "__main__":
     else:
         print(f"Error: Unknown command '{command}'")
         print("\nAvailable commands:")
-        print("  list   : Show YOUR own folders in Google Drive")
-        print("  shared : Show files and folders shared with you")
-        print("  drives : Show Shared Drives (Team Drives)")
-        print("  upload : Upload images from any folder (yours or shared)")
+        print("  list       : Show YOUR own folders in Google Drive")
+        print("  shared     : Show files and folders shared with you")
+        print("  drives     : Show Shared Drives (Team Drives)")
+        print("  cloudinary : Show existing folders and images in Cloudinary")
+        print("  upload     : Upload images from any folder (yours or shared)")
         print("\nRun 'python googledrive_tocloudinary.py' for detailed usage information")
         sys.exit(1)
