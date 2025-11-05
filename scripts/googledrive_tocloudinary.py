@@ -2337,6 +2337,148 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
                     logging.info(f"  - {err}")
                 logging.info("")
             
+            # Show detailed failed uploads if any
+            failed_uploads = [result for result in results if result.get('status') == 'failed']
+            if failed_uploads:
+                print(f"\n❌ FAILED UPLOADS ({len(failed_uploads)} files):")
+                print(f"{'File Name':<40} {'Error':<50}")
+                print(f"{'-'*90}")
+                
+                for failed in failed_uploads:
+                    filename = failed.get('local_filename', failed.get('filename', 'Unknown'))[:37]
+                    error = failed.get('error', 'Unknown error')[:47]
+                    print(f"{filename:<40} {error:<50}")
+                
+                logging.info(f"DETAILED FAILED UPLOADS ({len(failed_uploads)} files):")
+                for failed in failed_uploads:
+                    filename = failed.get('local_filename', failed.get('filename', 'Unknown'))
+                    error = failed.get('error', 'Unknown error')
+                    folder_path = failed.get('folder_path', '')
+                    logging.info(f"  FAILED: {filename} (folder: {folder_path}) - Error: {error}")
+                logging.info("")
+                
+                # Offer retry option
+                print(f"\n🔄 RETRY FAILED UPLOADS?")
+                print(f"Would you like to retry the {len(failed_uploads)} failed uploads?")
+                print(f"  1. YES - Retry all failed uploads")
+                print(f"  2. NO - Skip retry")
+                
+                retry_choice = input("\nEnter your choice (1/2): ").strip()
+                
+                if retry_choice == '1':
+                    print(f"\n🔄 Retrying {len(failed_uploads)} failed uploads...")
+                    logging.info(f"RETRYING FAILED UPLOADS: {len(failed_uploads)} files")
+                    
+                    # Extract failed file info for retry
+                    failed_files = []
+                    for failed in failed_uploads:
+                        # Find the original image file info
+                        for img in image_files:
+                            if (img['name'] == failed.get('filename') or 
+                                os.path.splitext(img['name'])[0] == failed.get('local_filename')):
+                                failed_files.append(img)
+                                break
+                    
+                    if failed_files:
+                        retry_start_time = time.time()
+                        retry_results = []
+                        
+                        # Reset progress counter for retry
+                        retry_progress = {'uploaded': 0, 'failed': 0, 'total': len(failed_files), 'skipped': 0}
+                        
+                        print(f"🔄 Retrying {len(failed_files)} failed uploads with {max_workers} threads...")
+                        
+                        # Use same ProcessPoolExecutor setup for retry
+                        with ProcessPoolExecutor(max_workers=max_workers) as retry_executor:
+                            retry_tasks = []
+                            for img in failed_files:
+                                retry_tasks.append((img, folder_name, credentials_file, cache.cache_file))
+                            
+                            retry_future_to_image = {}
+                            for i, task_args in enumerate(retry_tasks):
+                                future = retry_executor.submit(process_worker_upload, task_args)
+                                retry_future_to_image[future] = retry_tasks[i][0]
+                            
+                            for future in as_completed(retry_future_to_image):
+                                retry_result = future.result()
+                                retry_results.append(retry_result)
+                                
+                                if retry_result['status'] == 'success':
+                                    retry_progress['uploaded'] += 1
+                                    print(f"✅ Retry success: {retry_result['local_filename']}")
+                                elif retry_result['status'] == 'skipped':
+                                    retry_progress['skipped'] += 1
+                                    print(f"⏭️  Retry skipped: {retry_result['local_filename']}")
+                                else:
+                                    retry_progress['failed'] += 1
+                                    print(f"❌ Retry failed: {retry_result['local_filename']}")
+                        
+                        retry_elapsed = time.time() - retry_start_time
+                        retry_successful = retry_progress['uploaded']
+                        retry_failed = retry_progress['failed']
+                        retry_skipped = retry_progress['skipped']
+                        
+                        print(f"\n🔄 RETRY RESULTS:")
+                        print(f"  Retry completed in {retry_elapsed:.2f} seconds")
+                        print(f"  Successfully uploaded: {retry_successful}")
+                        print(f"  Still failed: {retry_failed}")
+                        print(f"  Skipped (already uploaded): {retry_skipped}")
+                        
+                        # Update overall results with retry results
+                        for retry_result in retry_results:
+                            # Remove old failed result and add retry result
+                            for i, result in enumerate(results):
+                                if (result.get('local_filename') == retry_result.get('local_filename') or
+                                    result.get('filename') == retry_result.get('filename')):
+                                    results[i] = retry_result
+                                    break
+                        
+                        # Recalculate statistics after retry
+                        final_stats = {'success': 0, 'failed': 0, 'skipped': 0}
+                        for result in results:
+                            status = result.get('status', 'unknown')
+                            if status in final_stats:
+                                final_stats[status] += 1
+                        
+                        # Save updated results to CSV
+                        try:
+                            with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+                                writer = csv.DictWriter(csvfile, fieldnames=csv_columns, extrasaction='ignore')
+                                writer.writeheader()
+                                writer.writerows(results)
+                            print(f"✅ Updated results saved to '{output_csv}'")
+                        except Exception as e:
+                            print(f"❌ Error updating CSV: {str(e)}")
+                        
+                        logging.info(f"RETRY OPERATION COMPLETED:")
+                        logging.info(f"  Retry time: {retry_elapsed:.2f} seconds")
+                        logging.info(f"  Retry successful: {retry_successful}")
+                        logging.info(f"  Retry failed: {retry_failed}")
+                        logging.info(f"  Retry skipped: {retry_skipped}")
+                        logging.info(f"  FINAL TOTALS - Success: {final_stats['success']}, Failed: {final_stats['failed']}, Skipped: {final_stats['skipped']}")
+                        logging.info("")
+                        
+                        # Show remaining failed uploads if any
+                        remaining_failed = [result for result in results if result.get('status') == 'failed']
+                        if remaining_failed:
+                            print(f"\n❌ STILL FAILED AFTER RETRY ({len(remaining_failed)} files):")
+                            for failed in remaining_failed:
+                                filename = failed.get('local_filename', failed.get('filename', 'Unknown'))
+                                error = failed.get('error', 'Unknown error')
+                                print(f"  - {filename}: {error}")
+                        else:
+                            print(f"\n🎉 All uploads successful after retry!")
+                    else:
+                        print(f"❌ Could not find original file info for retry")
+                        logging.warning("Could not find original file info for retry")
+                
+                elif retry_choice == '2':
+                    print(f"⏭️  Skipping retry of failed uploads")
+                    logging.info("User chose to skip retry of failed uploads")
+                else:
+                    print(f"Invalid choice. Skipping retry.")
+                    logging.info("Invalid retry choice. Skipping retry.")
+            
             # Final summary in log
             logging.info(f"OPERATION SUMMARY:")
             logging.info(f"  Operation: Upload Google Drive folder to Cloudinary")
@@ -2410,6 +2552,11 @@ if __name__ == "__main__":
         print("  ✓ Progress updates every 10 files in both console and log file")
         print("  ✓ Detailed per-folder statistics logged throughout operation")
         print("  ✓ Log files saved in data/log/ with timestamps")
+        print("\nFailed Upload Handling:")
+        print("  ✓ Detailed list of failed uploads shown at completion")
+        print("  ✓ Interactive retry option for failed uploads")
+        print("  ✓ Failed uploads cached for manual retry later")
+        print("  ✓ Error details logged for troubleshooting")
         print("\nSetup:")
         print("  1. Download credentials.json from Google Cloud Console")
         print("  2. Enable Google Drive API in your Google Cloud project")
