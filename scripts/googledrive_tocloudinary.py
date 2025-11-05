@@ -223,13 +223,21 @@ def setup_logging(folder_name):
     
     log_filename = LOG_DIR / f'{safe_folder_name}_{timestamp}.log'
     
+    # Configure logging with UTF-8 encoding for cross-platform compatibility
+    file_handler = logging.FileHandler(str(log_filename), encoding='utf-8')
+    console_handler = logging.StreamHandler()
+    
+    # On Windows, try to use UTF-8 encoding for console too
+    if platform.system() == 'Windows':
+        try:
+            console_handler.stream = open(console_handler.stream.fileno(), mode='w', encoding='utf-8', buffering=1)
+        except:
+            pass  # Fall back to default if UTF-8 setup fails
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(str(log_filename)),
-            logging.StreamHandler()  # Also print to console
-        ]
+        handlers=[file_handler, console_handler]
     )
     return str(log_filename)
 
@@ -958,7 +966,7 @@ def process_worker_upload(args):
                     else:
                         # Create new file with proper locking
                         # Use a temporary file to ensure atomic creation
-                        temp_cache_file = cache_file + '.tmp'
+                        temp_cache_file = str(cache_file) + '.tmp'
                         cache_data = {
                             'successful_uploads': {file_id: success_data},
                             'failed_uploads': {},
@@ -1052,7 +1060,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         logging.info(f"  Cleaned folder path: '{cloudinary_folder}'")
     
     thread_id = threading.current_thread().ident
-    logging.info(f"[Thread {thread_id}] Processing: {filename} (ID: {file_id}) → {cloudinary_folder}")
+    logging.info(f"[Thread {thread_id}] Processing: {filename} (ID: {file_id}) -> {cloudinary_folder}")
     
     # Already uploaded? return cached result and update progress
     if cache.is_uploaded(file_id):
@@ -1094,7 +1102,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
     public_permission_id = None
     
     try:
-        logging.info(f"START TRANSFER: {filename} → {cloudinary_folder}")
+        logging.info(f"START TRANSFER: {filename} -> {cloudinary_folder}")
         
         # 1) Check if file already has public access
         logging.info(f"  Checking file permissions: {filename}")
@@ -1158,7 +1166,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             current_format = get_current_format(original_url)
             if current_format == 'png':
                 result['jpg_url'] = convert_cloudinary_url_to_jpg(original_url)
-                logging.info(f"  🔄 Generated JPG URL: {filename}")
+                logging.info(f"  [JPG] Generated JPG URL: {filename}")
             else:
                 result['jpg_url'] = original_url  # Already JPG or other format
         else:
@@ -1169,7 +1177,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         with progress_lock:
             progress_counter['uploaded'] += 1
             current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
-            logging.info(f"SUCCESS: {filename} → {result['cloudinary_url']}")
+            logging.info(f"SUCCESS: {filename} -> {result['cloudinary_url']}")
             
             # Real-time progress logging every 10 files or at completion
             if current % 10 == 0 or current == progress_counter['total']:
@@ -1744,7 +1752,7 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     logging.info(f"Found {len(image_files)} images across {len(folder_counts)} folder(s):")
     for folder_path, count in sorted(folder_counts.items()):
         cloudinary_path = f"{folder_name}/{folder_path}" if folder_path != '(root folder)' else folder_name
-        logging.info(f"  📁 {folder_path}: {count} images → will be uploaded to: {cloudinary_path}")
+        logging.info(f"  [FOLDER] {folder_path}: {count} images -> will be uploaded to: {cloudinary_path}")
     logging.info("")
     
     # Generate CSV filename based on folder name with timestamp
