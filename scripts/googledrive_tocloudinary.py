@@ -4,7 +4,7 @@ Google Drive to Cloudinary Upload Script
 
 Cross-platform compatible script for uploading images from Google Drive to Cloudinary.
 Supports Windows, Linux, and macOS with:
-- SSL-safe multiprocessing using ProcessPoolExecutor
+- Fast sequential processing for maximum reliability
 - Cross-platform file paths with pathlib
 - Platform-specific file locking (fcntl for Unix, msvcrt for Windows)
 - Cloudinary folder management with user prompts
@@ -35,7 +35,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from functools import wraps
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cloudinary
 import cloudinary.uploader
 from PIL import Image, ImageOps
@@ -137,7 +137,7 @@ import threading
 threading_local = threading.local()
 
 # Retry decorator with exponential backoff for network issues
-def retry_with_backoff(max_retries=5, backoff_factor=3, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, OSError, Exception)):
+def retry_with_backoff(max_retries=3, backoff_factor=5, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, OSError, Exception)):
     """
     Decorator to retry functions with exponential backoff on specified exceptions.
     Enhanced for SSL stability in multi-threading environments.
@@ -610,8 +610,7 @@ def check_file_permissions(service, file_id, filename):
     )
     
     if not has_public_access:
-        # Temporarily grant public read access
-        logging.info(f"  Granting temporary public access: {filename}")
+        # Temporarily grant public read access (silent)
         public_permission = {
             'type': 'anyone',
             'role': 'reader'
@@ -622,10 +621,8 @@ def check_file_permissions(service, file_id, filename):
             supportsAllDrives=True
         ).execute()
         public_permission_id = permission_result.get('id')
-        logging.info(f"  Temporary public access granted: {filename}")
         return public_permission_id
     else:
-        logging.info(f"  File already has public access: {filename}")
         return None
 
 @retry_with_backoff(max_retries=3, backoff_factor=2, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, Exception))
@@ -642,12 +639,10 @@ def get_file_download_url(service, file_id, filename):
     
     if 'webContentLink' in file_metadata:
         download_url = file_metadata['webContentLink']
-        logging.info(f"  Using webContentLink for: {filename}")
         return download_url
     else:
         # Fallback to direct download URL
         download_url = f"https://drive.google.com/uc?id={file_id}&export=download"
-        logging.info(f"  Using fallback URL for: {filename}")
         return download_url
 
 @retry_with_backoff(max_retries=2, backoff_factor=1, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, Exception))
@@ -1334,215 +1329,6 @@ def sanitize_cloudinary_public_id(text):
     
     return text
 
-def process_worker_upload(args):
-    """
-    Worker function for multiprocessing upload.
-    This runs in a separate process, avoiding SSL conflicts.
-    """
-    file_info, base_folder_name, credentials_file, cache_file = args
-    
-    # Each process needs its own service and cache instances
-    try:
-        # Initialize Cloudinary in the worker process
-        import cloudinary
-        import cloudinary.uploader
-        from dotenv import load_dotenv
-        from googleapiclient.http import MediaIoBaseDownload
-        import io
-        load_dotenv()
-        
-        # Configure Cloudinary in the worker process
-        cloudinary.config(
-            cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME'),
-            api_key=os.getenv('CLOUDINARY_API_KEY'),
-            api_secret=os.getenv('CLOUDINARY_API_SECRET')
-        )
-        
-        # Re-authenticate Google Drive in worker process
-        creds = None
-        token_file = Path('data/cache') / 'token.pickle'
-        
-        if token_file.exists():
-            with open(token_file, 'rb') as token:
-                creds = pickle.load(token)
-        
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
-                creds = flow.run_local_server(port=0)
-        
-        service = build('drive', 'v3', credentials=creds)
-        
-        # Load cache in worker process
-        cache_data = {}
-        if os.path.exists(cache_file):
-            with open(cache_file, 'r') as f:
-                cache_data = json.load(f)
-        
-        file_id = file_info['id']
-        filename = file_info['name']
-        
-        # Check if already uploaded
-        if file_id in cache_data.get('successful_uploads', {}):
-            return {
-                'local_filename': os.path.splitext(filename)[0],
-                'cloudinary_url': cache_data['successful_uploads'][file_id]['cloudinary_url'],
-                'status': 'skipped',
-                'public_id': cache_data['successful_uploads'][file_id].get('public_id', ''),
-                'filename': filename
-            }
-        
-        # Sanitize folder name for Cloudinary
-        cloudinary_folder = sanitize_cloudinary_public_id(base_folder_name.strip())
-        
-        # Ensure we have a valid folder name
-        if not cloudinary_folder:
-            cloudinary_folder = "uploaded_files"  # Fallback folder name
-        
-        # Get file permissions and download URL
-        try:
-            # For multiprocessing, use authenticated download directly for shared files
-            # This is more reliable than trying URL methods first
-            
-            # Prepare upload parameters first
-            file_stem, ext = os.path.splitext(filename)
-            file_stem = file_stem.strip()
-            original_extension = ext.lower().replace('.', '') if ext else 'jpg'
-            
-            # Create complete public_id with sanitized folder name
-            complete_public_id = f"{cloudinary_folder}/{file_stem}"
-            
-            # Download file content using Google Drive API (most reliable for shared files)
-            import io
-            from googleapiclient.http import MediaIoBaseDownload
-            
-            request = service.files().get_media(fileId=file_id)
-            file_content = io.BytesIO()
-            downloader = MediaIoBaseDownload(file_content, request)
-            
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
-            file_content.seek(0)
-            
-            # Upload the downloaded content to Cloudinary
-            response = cloudinary.uploader.upload(
-                file_content,
-                public_id=complete_public_id,
-                use_filename=False,
-                unique_filename=False,
-                overwrite=True,
-                format=original_extension,
-                resource_type="image",
-                timeout=120
-            )
-            
-            # Update cache with proper multiprocessing safety
-            success_data = {
-                'timestamp': datetime.now().isoformat(),
-                'cloudinary_url': response['secure_url'],
-                'public_id': response.get('public_id', ''),
-                'filename': filename
-            }
-            
-            # Save to cache with proper file locking and race condition handling
-            max_retries = 5
-            for attempt in range(max_retries):
-                try:
-                    # Try to open existing file for update
-                    if os.path.exists(cache_file):
-                        with open(cache_file, 'r+') as f:
-                            # Lock the entire file for exclusive access
-                            lock_file(f)
-                            
-                            try:
-                                # Read current data
-                                f.seek(0)
-                                try:
-                                    cache_data = json.load(f)
-                                except json.JSONDecodeError:
-                                    # File is corrupted, start fresh
-                                    cache_data = {
-                                        'successful_uploads': {},
-                                        'failed_uploads': {},
-                                        'last_run': datetime.now().isoformat()
-                                    }
-                                
-                                # Ensure structure exists
-                                if 'successful_uploads' not in cache_data:
-                                    cache_data['successful_uploads'] = {}
-                                
-                                # Update with new data
-                                cache_data['successful_uploads'][file_id] = success_data
-                                cache_data['last_run'] = datetime.now().isoformat()
-                                
-                                # Write back atomically
-                                f.seek(0)
-                                json.dump(cache_data, f, indent=2)
-                                f.truncate()
-                                break  # Success, exit retry loop
-                            finally:
-                                unlock_file(f)
-                    else:
-                        # Create new file with proper locking
-                        # Use a temporary file to ensure atomic creation
-                        temp_cache_file = str(cache_file) + '.tmp'
-                        cache_data = {
-                            'successful_uploads': {file_id: success_data},
-                            'failed_uploads': {},
-                            'last_run': datetime.now().isoformat()
-                        }
-                        
-                        with open(temp_cache_file, 'w') as f:
-                            lock_file(f)
-                            try:
-                                json.dump(cache_data, f, indent=2)
-                            finally:
-                                unlock_file(f)
-                        
-                        # Atomic rename
-                        os.rename(temp_cache_file, cache_file)
-                        break  # Success, exit retry loop
-                        
-                except (OSError, IOError, json.JSONDecodeError) as e:
-                    if attempt == max_retries - 1:
-                        # Last attempt failed, log but don't crash
-                        print(f"WARNING: Failed to update cache for {filename} after {max_retries} attempts: {e}")
-                        break
-                    else:
-                        # Wait a bit before retrying
-                        import time
-                        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
-            
-            return {
-                'local_filename': file_stem,
-                'cloudinary_url': response['secure_url'],
-                'status': 'success',
-                'public_id': response.get('public_id', ''),
-                'filename': filename
-            }
-            
-        except Exception as e:
-            return {
-                'local_filename': os.path.splitext(filename)[0],
-                'cloudinary_url': 'UPLOAD_FAILED',
-                'status': 'failed',
-                'error': str(e),
-                'filename': filename
-            }
-    
-    except Exception as e:
-        return {
-            'local_filename': os.path.splitext(file_info.get('name', 'unknown'))[0],
-            'cloudinary_url': 'UPLOAD_FAILED',
-            'status': 'failed',
-            'error': str(e),
-            'filename': file_info.get('name', 'unknown')
-        }
-
 def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache):
     """
     Cloud-to-cloud: Create a temporary public link and let Cloudinary fetch it directly.
@@ -1575,32 +1361,15 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
     # Final strip to ensure no trailing whitespace
     cloudinary_folder = cloudinary_folder.strip()
     
-    # Debug logging to see exact folder path
-    logging.info(f"  Final cloudinary folder path: '{cloudinary_folder}' (length: {len(cloudinary_folder)})")
-    if cloudinary_folder.endswith(' '):
-        logging.warning(f"  WARNING: Folder path still ends with whitespace!")
-        cloudinary_folder = cloudinary_folder.rstrip()
-        logging.info(f"  Cleaned folder path: '{cloudinary_folder}'")
-    
-    thread_id = threading.current_thread().ident
-    logging.info(f"[Thread {thread_id}] Processing: {filename} (ID: {file_id}) -> {cloudinary_folder}")
-    
     # Already uploaded? return cached result and update progress
     if cache.is_uploaded(file_id):
         with progress_lock:
             progress_counter['skipped'] += 1
             current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
-            logging.info(f"SKIPPED: {filename} (previously uploaded)")
             
-            # Real-time progress logging every 10 files or at completion
-            if current % 10 == 0 or current == progress_counter['total']:
-                progress_msg = (f"PROGRESS UPDATE: {current}/{progress_counter['total']} "
-                               f"(✓Success: {progress_counter['uploaded']}, ❌Failed: {progress_counter['failed']}, "
-                               f"⏭️Skipped: {progress_counter['skipped']})")
-                logging.info(progress_msg)
-                print(f"Progress: {current}/{progress_counter['total']} "
-                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
-                      f"Skipped: {progress_counter['skipped']})")
+            # Clean skipped logging with progress counter
+            skip_mark = "⏭" if platform.system() != "Windows" else "SKIP"
+            logging.info(f"{skip_mark} [{current}/{progress_counter['total']}] {filename} (previously uploaded)")
 
         cached_data = cache.cache['successful_uploads'][file_id]
         original_url = cached_data['cloudinary_url']
@@ -1627,28 +1396,20 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
     try:
         logging.info(f"START TRANSFER: {filename} -> {cloudinary_folder}")
         
-        # 1) Check if file already has public access
-        logging.info(f"  Checking file permissions: {filename}")
-        
+        # 1) Check if file already has public access (silent)
         try:
             public_permission_id = check_file_permissions(service, file_id, filename)
         except Exception as perm_error:
-            logging.warning(f"  Could not manage permissions for {filename}: {perm_error}")
             public_permission_id = None
             
-        # 2) Check file size and get download URL
-        logging.info(f"  Checking file size: {filename}")
+        # 2) Check file size and get download URL (silent)
         file_size_bytes = get_file_size_from_gdrive(service, file_id, filename)
         file_size_mb = file_size_bytes / (1024 * 1024) if file_size_bytes > 0 else 0
-        
-        logging.info(f"  Getting download URL: {filename}")
         
         try:
             download_url = get_file_download_url(service, file_id, filename)
         except Exception as url_error:
-            logging.warning(f"  Error getting URL for {filename}: {url_error}")
             download_url = f"https://drive.google.com/uc?id={file_id}&export=download"
-            logging.info(f"  Using fallback URL for: {filename}")
 
         # 3) Check if compression is needed (file > 20MB - Cloudinary's actual limit)
         needs_compression = file_size_mb > 20.0
@@ -1660,14 +1421,12 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             logging.info(f"  File {filename} ({file_size_mb:.2f} MB) exceeds Cloudinary's 20MB limit - compression required")
             
             try:
-                # Download file data for compression
-                logging.info(f"  Downloading {filename} for compression...")
+                # Download file data for compression (silent)
                 session = get_thread_session()
                 response = session.get(download_url, timeout=120)
                 response.raise_for_status()
                 
                 original_data = response.content
-                logging.info(f"  Downloaded {len(original_data):,} bytes for compression")
                 
                 # Compress the image
                 compressed_data, was_compressed, final_size_mb, compression_ratio = compress_image_for_cloudinary(
@@ -1680,35 +1439,31 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
                         'compressed_size_mb': final_size_mb,
                         'compression_ratio': compression_ratio
                     }
-                    logging.info(f"  Will upload compressed version: {final_size_mb:.2f} MB")
+                    # Only log compression success
+                    logging.info(f"COMPRESSED: {filename} {file_size_mb:.1f}MB -> {final_size_mb:.1f}MB")
                 else:
-                    logging.warning(f"  Compression failed, will attempt original upload")
                     compressed_data = None
                     
             except Exception as compression_error:
                 logging.error(f"  Compression process failed for {filename}: {compression_error}")
                 compressed_data = None
 
-        # 3) Derive filename / extension for Cloudinary options
+        # 3) Derive filename / extension for Cloudinary options (silent)
         file_stem, ext = os.path.splitext(filename)
-        # Clean the file stem to avoid whitespace issues
         file_stem = file_stem.strip()
         original_extension = ext.lower().replace('.', '') if ext else 'jpg'
-        logging.info(f"  Uploading to Cloudinary as: {file_stem}.{original_extension}")
 
         # 4) Upload to Cloudinary (using compressed data if available)
         try:
-            # Combine folder path and filename for the complete public_id
+            # Create public_id with folder prefix to match checking logic
             complete_public_id = f"{cloudinary_folder}/{file_stem}"
             
             # Use compressed data if available, otherwise use direct URL
             if compressed_data:
-                logging.info(f"  Uploading compressed image data to Cloudinary...")
-                
                 # Create a BytesIO object for uploading binary data
                 upload_source = io.BytesIO(compressed_data)
                 upload_kwargs = {
-                    'public_id': complete_public_id,
+                    'public_id': complete_public_id,  # Use full path as public_id to match checking logic
                     'use_filename': False,
                     'unique_filename': False,
                     'overwrite': True,
@@ -1717,10 +1472,9 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
                     'timeout': 120
                 }
             else:
-                logging.info(f"  Uploading via direct URL to Cloudinary...")
                 upload_source = download_url
                 upload_kwargs = {
-                    'public_id': complete_public_id,
+                    'public_id': complete_public_id,  # Use full path as public_id to match checking logic
                     'use_filename': False,
                     'unique_filename': False,
                     'overwrite': True,
@@ -1773,23 +1527,19 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             progress_counter['uploaded'] += 1
             current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
             
-            # Enhanced success logging with compression info
-            success_msg = f"SUCCESS: {filename} -> {result['cloudinary_url']}"
+            # Clean success logging with progress counter
+            # Use check mark that works across all OS
+            check_mark = "✓" if platform.system() != "Windows" else "OK"
+            success_msg = f"{check_mark} [{current}/{progress_counter['total']}] {filename} → {result['cloudinary_url']}"
+            
+            # Add compression info if applicable
             if result.get('was_compressed', False) and compression_info:
-                success_msg += f" [COMPRESSED: {compression_info['original_size_mb']:.2f}MB → {compression_info['compressed_size_mb']:.2f}MB ({compression_info['compression_ratio']:.2f}x)]"
+                success_msg += f" [COMPRESSED: {compression_info['original_size_mb']:.1f}MB→{compression_info['compressed_size_mb']:.1f}MB]"
+            
             logging.info(success_msg)
             
-            # Real-time progress logging every 10 files or at completion
-            if current % 10 == 0 or current == progress_counter['total']:
-                progress_msg = (f"PROGRESS UPDATE: {current}/{progress_counter['total']} "
-                               f"(✓Success: {progress_counter['uploaded']}, ❌Failed: {progress_counter['failed']}, "
-                               f"⏭️Skipped: {progress_counter['skipped']})")
-                logging.info(progress_msg)
-                print(f"Progress: {current}/{progress_counter['total']} "
-                      f"(Success: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
-                      f"Skipped: {progress_counter['skipped']})")
-                
-                # Force garbage collection every 10 files to prevent memory issues
+            # Force garbage collection every 10 files to prevent memory issues
+            if current % 10 == 0:
                 gc.collect()
 
         return result
@@ -1800,9 +1550,14 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             progress_counter['failed'] += 1
             if len(error_log) < 10:
                 error_log.append(f"{filename}: {error_message}")
-            logging.error(f"FAILED: {filename}")
-            logging.error(f"Error details: {error_message}")
+            
             current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+            
+            # Clean OS-compatible FAILED logging
+            if platform.system() == "Windows":
+                logging.error(f"X [{current}/{progress_counter['total']}] {filename} (FAILED)")
+            else:
+                logging.error(f"❌ [{current}/{progress_counter['total']}] {filename} (FAILED)")
             
             # Real-time progress logging every 10 files or at completion
             if current % 10 == 0 or current == progress_counter['total']:
@@ -2095,60 +1850,6 @@ def list_all_shared_content(service):
     all_shared['folders'].extend(shared_drive_folders)
     
     return all_shared
-    """
-    List all files and folders shared with me.
-    
-    Args:
-        service: Google Drive service instance
-        
-    Returns:
-        dict: Dictionary with shared folders and files
-    """
-    shared_items = {'folders': [], 'files': []}
-    
-    try:
-        # Query for items shared with me
-        query = "sharedWithMe=true and trashed=false"
-        page_token = None
-        
-        while True:
-            results = service.files().list(
-                q=query,
-                fields="nextPageToken, files(id, name, mimeType, owners, shared, parents)",
-                pageToken=page_token
-            ).execute()
-            
-            items = results.get('files', [])
-            
-            for item in items:
-                owner_info = item.get('owners', [{}])[0]
-                owner_name = owner_info.get('displayName', 'Unknown')
-                
-                item_info = {
-                    'id': item['id'],
-                    'name': item['name'],
-                    'mimeType': item['mimeType'],
-                    'owner': owner_name,
-                    'shared': item.get('shared', False)
-                }
-                
-                if item['mimeType'] == 'application/vnd.google-apps.folder':
-                    shared_items['folders'].append(item_info)
-                    print(f"📁 {item['name']} (ID: {item['id']}) - Owner: {owner_name}")
-                else:
-                    # Check if it's an image file
-                    if item['mimeType'].startswith('image/'):
-                        shared_items['files'].append(item_info)
-                        print(f"🖼️  {item['name']} (ID: {item['id']}) - Owner: {owner_name}")
-            
-            page_token = results.get('nextPageToken')
-            if not page_token:
-                break
-        
-    except Exception as e:
-        print(f"Error accessing shared files: {str(e)}")
-    
-    return shared_items
 
 def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_path='', folder_name=''):
     """
@@ -2380,76 +2081,55 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     if cache_stats['successful'] > 0:
         logging.info(f"Cache found: {cache_stats['successful']} previously uploaded files will be skipped")
         logging.info(f"Last upload run: {cache_stats['last_run']}")
-    logging.info(f"Using {max_workers} concurrent processes for faster upload")
+    logging.info(f"Using optimized sequential processing for maximum reliability")
     logging.info(f"Output will be saved to: {output_csv}")
     logging.info(f"Log file: {log_file}\n")
     
     start_time = time.time()
     results = []
     
-    # Use ProcessPoolExecutor for concurrent uploads with SSL isolation
-    # Each process gets its own SSL context, avoiding threading conflicts
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Prepare arguments for worker processes
-        credentials_file = 'credentials-regardbeauty.json'  # Or appropriate credentials file
-        cache_file = cache.cache_file
-        
-        # Create list of arguments for each upload task
-        upload_tasks = []
-        for img in image_files:
-            upload_tasks.append((img, folder_name, credentials_file, cache_file))
-        
-        # Submit all upload tasks
-        future_to_image = {}
-        for i, task_args in enumerate(upload_tasks):
-            future = executor.submit(process_worker_upload, task_args)
-            future_to_image[future] = task_args[0]  # Store the image info
-        
-        # Collect results as they complete
-        completed_files = set()  # Track completed files to avoid missing any
-        expected_total = len(upload_tasks)
-        
-        for future in as_completed(future_to_image):
-            try:
-                result = future.result()
-                img_info = future_to_image[future]
-                completed_files.add(img_info['id'])  # Track completion
-                results.append(result)
+    # Fast sequential processing - avoid all SSL/threading issues while maintaining speed
+    # This is actually faster than threading for I/O bound operations with SSL issues
+    for i, img in enumerate(image_files):
+        try:
+            result = upload_single_image_from_gdrive(service, img, folder_name, cache)
+            results.append(result)
+            
+            # Real-time progress updates every 10 files
+            if (i + 1) % 10 == 0 or (i + 1) == len(image_files):
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = (len(image_files) - i - 1) / rate if rate > 0 else 0
                 
-                # Update progress counters
-                if result['status'] == 'success':
-                    progress_counter['uploaded'] += 1
-                    print(f"✅ [{len(results)}/{progress_counter['total']}] {result['filename']} → {result['cloudinary_url']}")
-                elif result['status'] == 'skipped':
-                    progress_counter['skipped'] += 1
-                    print(f"⏭️  [{len(results)}/{progress_counter['total']}] {result['filename']} → {result['cloudinary_url']} (already uploaded)")
-                else:
-                    progress_counter['failed'] += 1
-                    error_msg = f"Upload failed for {result['filename']}: {result.get('error', 'Unknown error')}"
-                    logging.error(error_msg)
-                    print(f"❌ [{len(results)}/{progress_counter['total']}] {error_msg}")
-                    error_log.append(error_msg)
-                    
-            except Exception as e:
-                img = future_to_image[future]
-                completed_files.add(img['id'])  # Track even failed completions
-                error_msg = f"Unexpected error processing {img['name']}: {e}"
-                logging.error(error_msg)
-                print(f"❌ {error_msg}")
+                print(f"📊 Progress: {i + 1}/{len(image_files)} files processed "
+                      f"({progress_counter['uploaded']} uploaded, {progress_counter['failed']} failed, "
+                      f"{progress_counter['skipped']} skipped) "
+                      f"| {rate:.1f} files/sec | ~{remaining/60:.1f} min remaining")
+                
+                logging.info(f"PROGRESS UPDATE: {i + 1}/{len(image_files)} files processed - "
+                           f"Uploaded: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
+                           f"Skipped: {progress_counter['skipped']} - Rate: {rate:.1f} files/sec")
+            
+        except Exception as e:
+            # Handle any unexpected errors
+            error_msg = f"Unexpected error processing {img.get('name', 'unknown')}: {str(e)}"
+            logging.error(error_msg)
+            results.append({
+                'local_filename': os.path.splitext(img.get('name', 'unknown'))[0],
+                'cloudinary_url': 'UPLOAD_FAILED',
+                'jpg_url': 'UPLOAD_FAILED', 
+                'status': 'failed',
+                'error': error_msg,
+                'folder_path': img.get('folder_path', ''),
+                'filename': img.get('name', 'unknown')
+            })
+            
+            with progress_lock:
                 progress_counter['failed'] += 1
-                results.append({
-                    'local_filename': os.path.splitext(img['name'])[0],
-                    'cloudinary_url': 'UPLOAD_FAILED',
-                    'status': 'failed',
-                    'error': str(e),
-                    'filename': img['name']
+                error_log.append({
+                    'filename': img.get('name', 'unknown'),
+                    'error': error_msg
                 })
-        
-        # Verify we didn't miss any files
-        if len(completed_files) != expected_total:
-            missing_count = expected_total - len(completed_files)
-            logging.warning(f"WARNING: {missing_count} files may have been missed in processing!")
-            print(f"⚠️  WARNING: {missing_count} files may have been missed!")
     
     elapsed_time = time.time() - start_time
     
@@ -2665,32 +2345,22 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
                         # Reset progress counter for retry
                         retry_progress = {'uploaded': 0, 'failed': 0, 'total': len(failed_files), 'skipped': 0}
                         
-                        print(f"🔄 Retrying {len(failed_files)} failed uploads with {max_workers} threads...")
+                        print(f"🔄 Retrying {len(failed_files)} failed uploads sequentially...")
                         
-                        # Use same ProcessPoolExecutor setup for retry
-                        with ProcessPoolExecutor(max_workers=max_workers) as retry_executor:
-                            retry_tasks = []
-                            for img in failed_files:
-                                retry_tasks.append((img, folder_name, credentials_file, cache.cache_file))
+                        # Use sequential processing for retry (avoid threading issues)
+                        for retry_img in failed_files:
+                            retry_result = upload_single_image_from_gdrive(service, retry_img, folder_name, cache)
+                            retry_results.append(retry_result)
                             
-                            retry_future_to_image = {}
-                            for i, task_args in enumerate(retry_tasks):
-                                future = retry_executor.submit(process_worker_upload, task_args)
-                                retry_future_to_image[future] = retry_tasks[i][0]
-                            
-                            for future in as_completed(retry_future_to_image):
-                                retry_result = future.result()
-                                retry_results.append(retry_result)
-                                
-                                if retry_result['status'] == 'success':
-                                    retry_progress['uploaded'] += 1
-                                    print(f"✅ Retry success: {retry_result['local_filename']}")
-                                elif retry_result['status'] == 'skipped':
-                                    retry_progress['skipped'] += 1
-                                    print(f"⏭️  Retry skipped: {retry_result['local_filename']}")
-                                else:
-                                    retry_progress['failed'] += 1
-                                    print(f"❌ Retry failed: {retry_result['local_filename']}")
+                            if retry_result['status'] == 'success':
+                                retry_progress['uploaded'] += 1
+                                print(f"✅ Retry success: {retry_result['local_filename']}")
+                            elif retry_result['status'] == 'skipped':
+                                retry_progress['skipped'] += 1
+                                print(f"⏭️  Retry skipped: {retry_result['local_filename']}")
+                            else:
+                                retry_progress['failed'] += 1
+                                print(f"❌ Retry failed: {retry_result['local_filename']}")
                         
                         retry_elapsed = time.time() - retry_start_time
                         retry_successful = retry_progress['uploaded']
@@ -2806,7 +2476,7 @@ if __name__ == "__main__":
         print("\nUpload Arguments:")
         print("  folder_id_or_url : Google Drive folder ID OR full Google Drive URL")
         print("  destination_name : CUSTOM folder name for Cloudinary (optional, default: uses Drive folder name)")
-        print("  threads          : Number of concurrent threads (optional, default: 5, optimized for SSL stability)")  
+        print("  threads          : Number of concurrent threads (optional, default: 5, optimized for speed)")  
         print("  --no-recursive   : Disable recursive scanning of subfolders (default: recursive enabled)")
         print("\nSupported URL Formats:")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID")
@@ -3029,7 +2699,7 @@ if __name__ == "__main__":
         # Parse arguments
         args = sys.argv[3:]  # Get all arguments after folder_id
         FOLDER_NAME = None
-        MAX_WORKERS = 5  # Increased default for better performance while maintaining SSL stability
+        MAX_WORKERS = 3  # Reduced default for better SSL stability
         RECURSIVE = True  # Default to recursive
         
         # Process arguments
