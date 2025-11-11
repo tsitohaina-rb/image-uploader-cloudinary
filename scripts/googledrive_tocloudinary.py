@@ -1,10 +1,10 @@
-"""
-Google Drive to Cloudinary Upload Script
-========================================
+""" 
+Google Drive to Cloudinary Upload Script - Multiprocessing Version
+===================================================================
 
 Cross-platform compatible script for uploading images from Google Drive to Cloudinary.
 Supports Windows, Linux, and macOS with:
-- Fast sequential processing for maximum reliability
+- Fast multiprocessing for maximum performance
 - Cross-platform file paths with pathlib
 - Platform-specific file locking (fcntl for Unix, msvcrt for Windows)
 - Cloudinary folder management with user prompts
@@ -12,6 +12,7 @@ Supports Windows, Linux, and macOS with:
 
 Author: Tsitohaina
 Date: November 2024
+Modified: Converted to multiprocessing for better performance
 """
 
 import os
@@ -35,7 +36,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from functools import wraps
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import cloudinary
 import cloudinary.uploader
 from PIL import Image, ImageOps
@@ -46,7 +47,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from pathlib import Path
-from threading import Lock
+from multiprocessing import Manager, Lock as MPLock
 from dotenv import load_dotenv
 import time
 
@@ -132,19 +133,18 @@ ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
 ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
 
-# Threading-specific configuration
-import threading
-threading_local = threading.local()
+# Multiprocessing-specific configuration
+# Each process will create its own session, no need for thread-local storage
 
 # Retry decorator with exponential backoff for network issues
 def retry_with_backoff(max_retries=3, backoff_factor=5, exceptions=(ssl.SSLError, TimeoutError, ConnectionError, OSError, Exception)):
     """
     Decorator to retry functions with exponential backoff on specified exceptions.
-    Enhanced for SSL stability in multi-threading environments.
+    Enhanced for SSL stability in multi-processing environments.
     
     Args:
-        max_retries (int): Maximum number of retry attempts (increased to 5)
-        backoff_factor (float): Multiplier for delay between retries (increased to 3)
+        max_retries (int): Maximum number of retry attempts
+        backoff_factor (float): Multiplier for delay between retries
         exceptions (tuple): Tuple of exception types to catch and retry
     """
     def decorator(func):
@@ -160,13 +160,13 @@ def retry_with_backoff(max_retries=3, backoff_factor=5, exceptions=(ssl.SSLError
                     
                     # Progressive backoff with jitter to avoid thundering herd
                     base_wait = backoff_factor ** attempt
-                    jitter = base_wait * 0.1 * (0.5 - hash(threading.current_thread().ident) % 1000 / 1000)
+                    jitter = base_wait * 0.1 * (0.5 - hash(os.getpid()) % 1000 / 1000)
                     wait_time = base_wait + jitter
                     
                     error_type = type(e).__name__
-                    thread_id = threading.current_thread().ident
-                    logging.warning(f"  [Thread {thread_id}] Attempt {attempt + 1} failed with {error_type}: {str(e)}")
-                    logging.info(f"  [Thread {thread_id}] Retrying in {wait_time:.2f} seconds...")
+                    process_id = os.getpid()
+                    logging.warning(f"  [Process {process_id}] Attempt {attempt + 1} failed with {error_type}: {str(e)}")
+                    logging.info(f"  [Process {process_id}] Retrying in {wait_time:.2f} seconds...")
                     time.sleep(wait_time)
             return None
         return wrapper
@@ -176,7 +176,7 @@ def retry_with_backoff(max_retries=3, backoff_factor=5, exceptions=(ssl.SSLError
 def create_robust_session():
     """
     Create a requests session with proper retry strategy and connection pooling.
-    Optimized for multi-threading to avoid SSL errors.
+    Optimized for multi-processing to avoid SSL errors.
     """
     session = requests.Session()
     
@@ -192,7 +192,7 @@ def create_robust_session():
     # Conservative connection pooling to avoid SSL conflicts
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
-        pool_connections=1,  # One connection per thread
+        pool_connections=1,  # One connection per process
         pool_maxsize=1       # Single connection in pool
     )
     
@@ -201,13 +201,8 @@ def create_robust_session():
     
     return session
 
-def get_thread_session():
-    """
-    Get a thread-local session to avoid SSL conflicts between threads.
-    """
-    if not hasattr(threading_local, 'session'):
-        threading_local.session = create_robust_session()
-    return threading_local.session
+# Note: In multiprocessing, each process will create its own session
+# No need for thread-local storage as each process has its own memory space
 
 # Google Drive API scopes - Updated to include full drive access for file permissions
 SCOPES = [
@@ -424,10 +419,11 @@ def validate_folder_id(service, folder_id):
         else:
             return False, None, f"Error accessing folder: {error_msg}"
 
-# Thread-safe counter and lock for progress tracking
-progress_lock = Lock()
-progress_counter = {'uploaded': 0, 'failed': 0, 'total': 0, 'skipped': 0}
-error_log = []
+# Process-safe counter and lock for progress tracking
+# These will be initialized in the main function using Manager
+progress_lock = None
+progress_counter = None
+error_log = None
 
 class UploadCache:
     """Manages the cache of uploaded files to support resume functionality"""
@@ -448,17 +444,20 @@ class UploadCache:
             if existing_caches:
                 # Use the most recent existing cache file
                 self.cache_file = Path(max(existing_caches, key=os.path.getctime))
-                print(f"🔄 RESUMING: Found existing cache file: {self.cache_file.name}")
+                # Don't print in worker processes (only main process should announce cache)
             else:
                 # Create new cache file with current timestamp
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 self.cache_file = CACHE_DIR / f'gdrive_upload_cache_{safe_folder_name}_{timestamp}.json'
-                print(f"🆕 STARTING: Creating new cache file: {self.cache_file.name}")
+                # Don't print in worker processes
         else:
             # Fallback to hash-based naming if no folder name provided
             folder_hash = hashlib.md5(folder_path.encode()).hexdigest()
             self.cache_file = CACHE_DIR / f'gdrive_upload_cache_{folder_hash}.json'
         
+        # Use regular Lock for file operations (not shared between processes)
+        # Each process will have its own cache instance
+        from threading import Lock
         self.lock = Lock()
         self.cache = self._load_cache()
     
@@ -523,6 +522,86 @@ class UploadCache:
             'failed': len(self.cache['failed_uploads']),
             'last_run': self.cache['last_run']
         }
+
+class FolderScanCache:
+    """Manages the cache of scanned folder structure to avoid repeated API calls"""
+    
+    def __init__(self, folder_id: str, folder_name: str | None = None):
+        """Initialize folder scan cache for a specific Google Drive folder"""
+        self.folder_id = folder_id
+        
+        # Create cache file name for folder scan
+        if folder_name:
+            safe_folder_name = folder_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('<', '_').replace('>', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_').strip()
+            self.cache_file = CACHE_DIR / f'gdrive_scan_cache_{safe_folder_name}_{folder_id}.json'
+        else:
+            folder_hash = hashlib.md5(folder_id.encode()).hexdigest()
+            self.cache_file = CACHE_DIR / f'gdrive_scan_cache_{folder_hash}.json'
+        
+        from threading import Lock
+        self.lock = Lock()
+    
+    def load_cached_scan(self) -> dict | None:
+        """Load cached folder scan if available and valid"""
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                
+                # Validate cache structure
+                if 'folder_id' in cache_data and 'image_files' in cache_data and 'scan_timestamp' in cache_data:
+                    # Check if cache is for the same folder
+                    if cache_data['folder_id'] == self.folder_id:
+                        return cache_data
+        except Exception as e:
+            print(f"Warning: Could not load folder scan cache: {e}")
+        return None
+    
+    def save_scan(self, image_files: list, recursive: bool):
+        """Save folder scan results to cache"""
+        try:
+            cache_data = {
+                'folder_id': self.folder_id,
+                'scan_timestamp': datetime.now().isoformat(),
+                'recursive': recursive,
+                'image_count': len(image_files),
+                'image_files': image_files
+            }
+            
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            return True
+        except Exception as e:
+            print(f"Warning: Could not save folder scan cache: {e}")
+            return False
+    
+    def clear_cache(self):
+        """Remove the cached folder scan"""
+        try:
+            if self.cache_file.exists():
+                self.cache_file.unlink()
+                return True
+        except Exception as e:
+            print(f"Warning: Could not clear folder scan cache: {e}")
+        return False
+    
+    def get_cache_info(self) -> dict | None:
+        """Get information about cached scan without loading full data"""
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                
+                return {
+                    'exists': True,
+                    'timestamp': cache_data.get('scan_timestamp', 'Unknown'),
+                    'image_count': cache_data.get('image_count', 0),
+                    'recursive': cache_data.get('recursive', False)
+                }
+        except:
+            pass
+        return None
 
 def authenticate_google_drive():
     """Authenticate and return Google Drive service"""
@@ -1329,17 +1408,46 @@ def sanitize_cloudinary_public_id(text):
     
     return text
 
+def _upload_worker(file_info, base_folder_name, folder_id, folder_name, p_lock, p_counter, p_error_log):
+    """
+    Worker function for multiprocessing.
+    Each process creates its own Google Drive service and cache.
+    """
+    # Set global variables for this process
+    global progress_lock, progress_counter, error_log
+    progress_lock = p_lock
+    progress_counter = p_counter
+    error_log = p_error_log
+    
+    # Each process needs its own service instance
+    service = authenticate_google_drive()
+    if not service:
+        return {
+            'local_filename': file_info.get('name', 'unknown'),
+            'cloudinary_url': 'UPLOAD_FAILED',
+            'jpg_url': 'UPLOAD_FAILED',
+            'status': 'failed',
+            'error': 'Failed to authenticate Google Drive',
+            'folder_path': file_info.get('folder_path', ''),
+            'filename': file_info.get('name', 'unknown')
+        }
+    
+    # Each process needs its own cache instance
+    cache = UploadCache(folder_id, folder_name)
+    
+    return upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
+
 def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache):
     """
     Cloud-to-cloud: Create a temporary public link and let Cloudinary fetch it directly.
-    Enhanced with thread-local sessions to avoid SSL conflicts.
+    Enhanced for multiprocessing - each process creates its own session.
     """
     file_id = file_info['id']
     filename = file_info['name']
     folder_path = file_info.get('folder_path', '')
     
-    # Get thread-local session for this upload
-    session = get_thread_session()
+    # Create a session for this process (each process has its own session)
+    session = create_robust_session()
     
     # Create the full Cloudinary folder path with comprehensive whitespace cleaning
     # Use only the base folder name for a flatter structure
@@ -1363,13 +1471,16 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
     
     # Already uploaded? return cached result and update progress
     if cache.is_uploaded(file_id):
-        with progress_lock:
-            progress_counter['skipped'] += 1
-            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
-            
-            # Clean skipped logging with progress counter
-            skip_mark = "⏭" if platform.system() != "Windows" else "SKIP"
-            logging.info(f"{skip_mark} [{current}/{progress_counter['total']}] {filename} (previously uploaded)")
+        if progress_lock is not None:
+            with progress_lock:
+                progress_counter['skipped'] += 1
+                current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+                
+                # Clean skipped logging with progress counter
+                skip_mark = "⏭" if platform.system() != "Windows" else "SKIP"
+                logging.info(f"{skip_mark} [{current}/{progress_counter['total']}] {filename} (previously uploaded)")
+        else:
+            logging.error(f"ERROR: progress_lock is None in process {os.getpid()} for file {filename}")
 
         cached_data = cache.cache['successful_uploads'][file_id]
         original_url = cached_data['cloudinary_url']
@@ -1422,7 +1533,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             
             try:
                 # Download file data for compression (silent)
-                session = get_thread_session()
+                # Use the session already created at the beginning of this function
                 response = session.get(download_url, timeout=120)
                 response.raise_for_status()
                 
@@ -1490,7 +1601,8 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             error_msg = f"Cloudinary upload failed: {str(cloudinary_error)}"
             if compressed_data:
                 error_msg += f" (compressed from {file_size_mb:.2f} MB)"
-            logging.error(f"[Thread {thread_id}] {error_msg}")
+            process_id = os.getpid()
+            logging.error(f"[Process {process_id}] {error_msg}")
             raise Exception(error_msg)
 
         result = {
@@ -1523,35 +1635,37 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
 
         # 5) Cache + progress + real-time logging
         cache.mark_uploaded(file_id, result)
-        with progress_lock:
-            progress_counter['uploaded'] += 1
-            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
-            
-            # Clean success logging with progress counter
-            # Use check mark that works across all OS
-            check_mark = "✓" if platform.system() != "Windows" else "OK"
-            success_msg = f"{check_mark} [{current}/{progress_counter['total']}] {filename} → {result['cloudinary_url']}"
-            
-            # Add compression info if applicable
-            if result.get('was_compressed', False) and compression_info:
-                success_msg += f" [COMPRESSED: {compression_info['original_size_mb']:.1f}MB→{compression_info['compressed_size_mb']:.1f}MB]"
-            
-            logging.info(success_msg)
-            
-            # Force garbage collection every 10 files to prevent memory issues
-            if current % 10 == 0:
-                gc.collect()
+        if progress_lock is not None:
+            with progress_lock:
+                progress_counter['uploaded'] += 1
+                current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+                
+                # Clean success logging with progress counter
+                # Use check mark that works across all OS
+                check_mark = "✓" if platform.system() != "Windows" else "OK"
+                success_msg = f"{check_mark} [{current}/{progress_counter['total']}] {filename} → {result['cloudinary_url']}"
+                
+                # Add compression info if applicable
+                if result.get('was_compressed', False) and compression_info:
+                    success_msg += f" [COMPRESSED: {compression_info['original_size_mb']:.1f}MB→{compression_info['compressed_size_mb']:.1f}MB]"
+                
+                logging.info(success_msg)
+                
+                # Force garbage collection every 10 files to prevent memory issues
+                if current % 10 == 0:
+                    gc.collect()
 
         return result
 
     except Exception as e:
         error_message = str(e)
-        with progress_lock:
-            progress_counter['failed'] += 1
-            if len(error_log) < 10:
-                error_log.append(f"{filename}: {error_message}")
-            
-            current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
+        if progress_lock is not None:
+            with progress_lock:
+                progress_counter['failed'] += 1
+                if len(error_log) < 10:
+                    error_log.append(f"{filename}: {error_message}")
+                
+                current = progress_counter['uploaded'] + progress_counter['failed'] + progress_counter['skipped']
             
             # Clean OS-compatible FAILED logging
             if platform.system() == "Windows":
@@ -1851,7 +1965,7 @@ def list_all_shared_content(service):
     
     return all_shared
 
-def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_path='', folder_name=''):
+def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_path='', folder_name='', scan_counter=None):
     """
     Get list of image files from a Google Drive folder, optionally including subfolders.
     
@@ -1861,6 +1975,7 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
         recursive (bool): If True, scan subfolders recursively
         parent_path (str): Path to parent folder for organizing in Cloudinary
         folder_name (str): Current folder name for logging
+        scan_counter (dict): Shared counter dict with 'count' key for progress tracking
         
     Returns:
         list: List of image file information dictionaries with folder_path for organization
@@ -1896,6 +2011,10 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
                     'folder_path': parent_path.strip() if parent_path else '',  # Clean the folder path
                     'folder_name': folder_name.strip() if folder_name else ''
                 })
+                
+                # Update counter in real-time (only at root level to avoid spam)
+                if scan_counter is not None and not parent_path:
+                    scan_counter['count'] = len(image_files)
             
             page_token = results.get('nextPageToken')
             if not page_token:
@@ -1917,21 +2036,33 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
                 ).execute()
                 
                 subfolders = results.get('files', [])
-                for subfolder in subfolders:
+                for i, subfolder in enumerate(subfolders, 1):
                     # Clean subfolder name to remove any whitespace
                     clean_subfolder_name = subfolder['name'].strip()
                     subfolder_path = f"{parent_path.strip()}/{clean_subfolder_name}" if parent_path else clean_subfolder_name
-                    print(f"  📁 Scanning subfolder: {subfolder_path}")
+                    
+                    # Print folder name on new line at root level
+                    if scan_counter is not None and not parent_path:
+                        print(f"\n  📁 {clean_subfolder_name}: scanning...", end='', flush=True)
                     
                     # Recursively get images from subfolder
+                    before_count = len(image_files)
                     subfolder_images = get_images_from_gdrive_folder(
                         service, 
                         subfolder['id'], 
                         recursive=True, 
                         parent_path=subfolder_path,
-                        folder_name=clean_subfolder_name
+                        folder_name=clean_subfolder_name,
+                        scan_counter=scan_counter
                     )
                     image_files.extend(subfolder_images)
+                    after_count = len(image_files)
+                    
+                    # Show final count for this folder on same line
+                    if scan_counter is not None and not parent_path:
+                        folder_image_count = after_count - before_count
+                        scan_counter['count'] = after_count
+                        print(f"\r  📁 {clean_subfolder_name}: {folder_image_count} images (total: {after_count})", flush=True)
                 
                 page_token = results.get('nextPageToken')
                 if not page_token:
@@ -1942,17 +2073,18 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
     
     return image_files
 
-def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=5, recursive=True):
+def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=None, recursive=True, force_rescan=False):
     """
-    Upload images from a Google Drive folder to Cloudinary using multi-threading.
+    Upload images from a Google Drive folder to Cloudinary using multiprocessing.
     Supports resuming interrupted uploads through caching and recursive subfolder scanning.
-    Enhanced with SSL-safe threading for better stability.
+    Enhanced with multiprocessing for maximum performance.
     
     Args:
         folder_id (str): Google Drive folder ID
         folder_name (str): Optional custom folder name for Cloudinary (default: uses Drive folder name)
-        max_workers (int): Number of concurrent upload threads (default: 5, optimized for SSL stability)
+        max_workers (int): Number of concurrent worker processes (default: CPU count)
         recursive (bool): If True, scan and upload from subfolders recursively (default: True)
+        force_rescan (bool): If True, ignore cached folder scan and rescan Drive (default: False)
     """
     
     # Test connections
@@ -2018,15 +2150,51 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     
     print()  # Add spacing before next section
     
-    # Get all images from Google Drive folder (with recursive scanning)
-    print(f"Scanning Google Drive folder: {folder_name} (ID: {folder_id})")
-    if recursive:
-        print("  📁 Recursive scanning enabled - will include subfolders")
-    else:
-        print("  📁 Scanning current folder only")
+    # Initialize folder scan cache
+    scan_cache = FolderScanCache(folder_id, folder_name)
+    image_files = None
+    used_cache = False
     
-    image_files = get_images_from_gdrive_folder(service, folder_id, recursive=recursive, folder_name=folder_name)
+    # Try to load cached scan if not forcing rescan
+    if not force_rescan:
+        cache_info = scan_cache.get_cache_info()
+        if cache_info:
+            print(f"💾 Found cached folder scan from {cache_info['timestamp'][:19]}")
+            print(f"   📂 Cached: {cache_info['image_count']} images")
+            
+            # Load the cached scan
+            cached_data = scan_cache.load_cached_scan()
+            if cached_data:
+                # Verify recursive setting matches
+                if cached_data.get('recursive') == recursive:
+                    image_files = cached_data['image_files']
+                    used_cache = True
+                    print(f"   ✅ Using cached scan (skipping folder traversal)")
+                    print(f"   💡 Use --force-rescan to scan Drive again\n")
+                else:
+                    print(f"   ⚠️  Cache recursive setting mismatch, will rescan")
     
+    # Perform actual scan if no cache or force rescan
+    if image_files is None:
+        if force_rescan:
+            print(f"🔄 Force rescan requested - ignoring cached data")
+        
+        print(f"Scanning Google Drive folder: {folder_name} (ID: {folder_id})")
+        if recursive:
+            print("  📁 Recursive scanning enabled - will include subfolders")
+        else:
+            print("  📁 Scanning current folder only")
+        
+        # Create a counter to track progress
+        scan_counter = {'count': 0}
+        image_files = get_images_from_gdrive_folder(service, folder_id, recursive=recursive, folder_name=folder_name, scan_counter=scan_counter)
+        
+        # Save the scan to cache for future use
+        if image_files:
+            print(f"\n💾 Saving folder scan to cache for faster resume...")
+            if scan_cache.save_scan(image_files, recursive):
+                print(f"   ✅ Scan cached successfully")
+        
     if not image_files:
         print(f"No images found in folder '{folder_name}'" + (" (including subfolders)" if recursive else ""))
         return
@@ -2068,12 +2236,30 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     cache = UploadCache(folder_id, folder_name)
     cache_stats = cache.get_stats()
     
+    # Announce cache status (only in main process)
+    if cache_stats['successful'] > 0:
+        print(f"🔄 RESUMING: Found {cache_stats['successful']} previously uploaded files in cache")
+        print(f"   Last run: {cache_stats['last_run']}")
+    else:
+        print(f"🆕 STARTING: New upload session (no previous cache found)")
+    
+    # Initialize multiprocessing Manager for shared state
+    manager = Manager()
+    global progress_lock, progress_counter, error_log
+    progress_lock = manager.Lock()
+    progress_counter = manager.dict()
+    error_log = manager.list()
+    
     # Initialize progress counter
     progress_counter['total'] = len(image_files)
     progress_counter['uploaded'] = 0
     progress_counter['failed'] = 0
     progress_counter['skipped'] = 0
-    error_log.clear()
+    
+    # Determine number of worker processes
+    if max_workers is None:
+        max_workers = multiprocessing.cpu_count()
+    print(f"Using {max_workers} worker processes for parallel uploads")
     
     logging.info(f"Processing folder: {folder_name}")
     logging.info(f"Recursive scanning: {recursive}")
@@ -2081,55 +2267,68 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     if cache_stats['successful'] > 0:
         logging.info(f"Cache found: {cache_stats['successful']} previously uploaded files will be skipped")
         logging.info(f"Last upload run: {cache_stats['last_run']}")
-    logging.info(f"Using optimized sequential processing for maximum reliability")
+    logging.info(f"Using multiprocessing with {max_workers} worker processes for maximum performance")
     logging.info(f"Output will be saved to: {output_csv}")
     logging.info(f"Log file: {log_file}\n")
     
     start_time = time.time()
     results = []
     
-    # Fast sequential processing - avoid all SSL/threading issues while maintaining speed
-    # This is actually faster than threading for I/O bound operations with SSL issues
-    for i, img in enumerate(image_files):
-        try:
-            result = upload_single_image_from_gdrive(service, img, folder_name, cache)
-            results.append(result)
+    # Multiprocessing for maximum performance
+    # Each process will have its own Google Drive service and session
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all upload tasks
+        # Pass folder_id, folder_name, and shared state so each worker can create its own service and cache
+        future_to_img = {
+            executor.submit(_upload_worker, img, folder_name, folder_id, folder_name, 
+                          progress_lock, progress_counter, error_log): img
+            for img in image_files
+        }
+        
+        # Process completed uploads as they finish
+        completed = 0
+        for future in as_completed(future_to_img):
+            img = future_to_img[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                # Handle any unexpected errors
+                error_msg = f"Unexpected error processing {img.get('name', 'unknown')}: {str(e)}"
+                logging.error(error_msg)
+                results.append({
+                    'local_filename': os.path.splitext(img.get('name', 'unknown'))[0],
+                    'cloudinary_url': 'UPLOAD_FAILED',
+                    'jpg_url': 'UPLOAD_FAILED', 
+                    'status': 'failed',
+                    'error': error_msg,
+                    'folder_path': img.get('folder_path', ''),
+                    'filename': img.get('name', 'unknown')
+                })
+                
+                if progress_lock is not None:
+                    with progress_lock:
+                        progress_counter['failed'] += 1
+                        error_log.append({
+                            'filename': img.get('name', 'unknown'),
+                            'error': error_msg
+                    })
             
             # Real-time progress updates every 10 files
-            if (i + 1) % 10 == 0 or (i + 1) == len(image_files):
+            completed += 1
+            if completed % 10 == 0 or completed == len(image_files):
                 elapsed = time.time() - start_time
-                rate = (i + 1) / elapsed if elapsed > 0 else 0
-                remaining = (len(image_files) - i - 1) / rate if rate > 0 else 0
+                rate = completed / elapsed if elapsed > 0 else 0
+                remaining = (len(image_files) - completed) / rate if rate > 0 else 0
                 
-                print(f"📊 Progress: {i + 1}/{len(image_files)} files processed "
+                print(f"📊 Progress: {completed}/{len(image_files)} files processed "
                       f"({progress_counter['uploaded']} uploaded, {progress_counter['failed']} failed, "
                       f"{progress_counter['skipped']} skipped) "
                       f"| {rate:.1f} files/sec | ~{remaining/60:.1f} min remaining")
                 
-                logging.info(f"PROGRESS UPDATE: {i + 1}/{len(image_files)} files processed - "
+                logging.info(f"PROGRESS UPDATE: {completed}/{len(image_files)} files processed - "
                            f"Uploaded: {progress_counter['uploaded']}, Failed: {progress_counter['failed']}, "
                            f"Skipped: {progress_counter['skipped']} - Rate: {rate:.1f} files/sec")
-            
-        except Exception as e:
-            # Handle any unexpected errors
-            error_msg = f"Unexpected error processing {img.get('name', 'unknown')}: {str(e)}"
-            logging.error(error_msg)
-            results.append({
-                'local_filename': os.path.splitext(img.get('name', 'unknown'))[0],
-                'cloudinary_url': 'UPLOAD_FAILED',
-                'jpg_url': 'UPLOAD_FAILED', 
-                'status': 'failed',
-                'error': error_msg,
-                'folder_path': img.get('folder_path', ''),
-                'filename': img.get('name', 'unknown')
-            })
-            
-            with progress_lock:
-                progress_counter['failed'] += 1
-                error_log.append({
-                    'filename': img.get('name', 'unknown'),
-                    'error': error_msg
-                })
     
     elapsed_time = time.time() - start_time
     
@@ -2473,11 +2672,14 @@ if __name__ == "__main__":
         print("  python googledrive_tocloudinary.py upload 'https://drive.google.com/drive/folders/1310NnlTK5tn8fX00TKF_BDAi0o7eK0d2' my_custom_folder")
         print("  # With custom settings:")
         print("  python googledrive_tocloudinary.py upload 'https://drive.google.com/drive/folders/1310NnlTK5tn8fX00TKF_BDAi0o7eK0d2' my_custom_folder 10 --no-recursive")
+        print("  # Force rescan (ignore cached folder structure):")
+        print("  python googledrive_tocloudinary.py upload FOLDER_ID --force-rescan")
         print("\nUpload Arguments:")
         print("  folder_id_or_url : Google Drive folder ID OR full Google Drive URL")
         print("  destination_name : CUSTOM folder name for Cloudinary (optional, default: uses Drive folder name)")
-        print("  threads          : Number of concurrent threads (optional, default: 5, optimized for speed)")  
+        print("  workers          : Number of worker processes (optional, default: CPU count, optimized for speed)")  
         print("  --no-recursive   : Disable recursive scanning of subfolders (default: recursive enabled)")
+        print("  --force-rescan   : Force rescan of Drive folder structure (ignore cached scan, useful if Drive changed)")
         print("\nSupported URL Formats:")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing")
@@ -2507,6 +2709,12 @@ if __name__ == "__main__":
         print("  ✓ Progressive JPEG compression with quality optimization")
         print("  ✓ Dimension reduction if quality reduction insufficient")
         print("  ✓ Compression details logged for each processed file")
+        print("\nSmart Caching System:")
+        print("  ✓ Folder scan results cached for instant resume")
+        print("  ✓ Upload progress tracked to skip completed files")
+        print("  ✓ Resume interrupted uploads without rescanning Drive")
+        print("  ✓ Use --force-rescan to pick up new files added to Drive")
+        print("  ✓ Cache files stored in data/cache/ directory")
         print("\nFailed Upload Handling:")
         print("  ✓ Detailed list of failed uploads shown at completion")
         print("  ✓ Interactive retry option for failed uploads")
@@ -2699,8 +2907,9 @@ if __name__ == "__main__":
         # Parse arguments
         args = sys.argv[3:]  # Get all arguments after folder_id
         FOLDER_NAME = None
-        MAX_WORKERS = 3  # Reduced default for better SSL stability
+        MAX_WORKERS = None  # Will use CPU count by default for multiprocessing
         RECURSIVE = True  # Default to recursive
+        FORCE_RESCAN = False  # Default to using cached scan
         
         # Process arguments
         i = 0
@@ -2708,13 +2917,15 @@ if __name__ == "__main__":
             arg = args[i]
             if arg == "--no-recursive":
                 RECURSIVE = False
-            elif arg == "--threads" and i + 1 < len(args):
-                # Handle --threads argument
+            elif arg == "--force-rescan":
+                FORCE_RESCAN = True
+            elif (arg == "--threads" or arg == "--processes" or arg == "--workers") and i + 1 < len(args):
+                # Handle --threads/--processes/--workers argument
                 try:
                     MAX_WORKERS = int(args[i + 1])
-                    i += 1  # Skip the next argument as it's the thread count
+                    i += 1  # Skip the next argument as it's the worker count
                 except ValueError:
-                    print(f"Warning: Invalid thread count '{args[i + 1]}', using default: {MAX_WORKERS}")
+                    print(f"Warning: Invalid worker count '{args[i + 1]}', using default (CPU count)")
                     i += 1
             elif arg.isdigit():
                 MAX_WORKERS = int(arg)
@@ -2731,11 +2942,14 @@ if __name__ == "__main__":
         print(f"📁 Source: {folder_id_or_url}")
         print(f"🆔 Folder ID: {FOLDER_ID}")
         print(f"📂 Destination folder name: {FOLDER_NAME}")
-        print(f"🧵 Concurrent threads: {MAX_WORKERS}")
+        workers_display = MAX_WORKERS if MAX_WORKERS else multiprocessing.cpu_count()
+        print(f"🔄 Worker processes: {workers_display}")
         print(f"🔄 Recursive scanning: {'Enabled' if RECURSIVE else 'Disabled'}")
+        if FORCE_RESCAN:
+            print(f"🔄 Force rescan: Enabled (will ignore cached folder scan)")
         print()
         
-        upload_gdrive_folder_to_cloudinary(FOLDER_ID, FOLDER_NAME, max_workers=MAX_WORKERS, recursive=RECURSIVE)
+        upload_gdrive_folder_to_cloudinary(FOLDER_ID, FOLDER_NAME, max_workers=MAX_WORKERS, recursive=RECURSIVE, force_rescan=FORCE_RESCAN)
     
     else:
         print(f"Error: Unknown command '{command}'")
