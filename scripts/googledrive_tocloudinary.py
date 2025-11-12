@@ -51,6 +51,47 @@ from multiprocessing import Manager, Lock as MPLock
 from dotenv import load_dotenv
 import time
 
+# Windows console encoding setup for emoji/Unicode support
+if platform.system() == "Windows":
+    try:
+        # Try to enable UTF-8 mode on Windows
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, OSError):
+        # Fallback for older Python versions or if reconfigure fails
+        import codecs
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'ignore')
+        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'ignore')
+
+# Cross-platform emoji/symbol compatibility
+IS_WINDOWS = platform.system() == "Windows"
+
+# Define symbols that work across platforms
+SYMBOLS = {
+    'check': 'OK' if IS_WINDOWS else '✓',
+    'cross': 'X' if IS_WINDOWS else '❌',
+    'folder': '[DIR]' if IS_WINDOWS else '📁',
+    'file': '[FILE]' if IS_WINDOWS else '📄',
+    'image': '[IMG]' if IS_WINDOWS else '🖼️',
+    'search': '[SEARCH]' if IS_WINDOWS else '🔍',
+    'lock': '[LOCK]' if IS_WINDOWS else '🔐',
+    'chart': '[STATS]' if IS_WINDOWS else '📊',
+    'warning': '[!]' if IS_WINDOWS else '⚠️',
+    'info': '[i]' if IS_WINDOWS else '💡',
+    'save': '[SAVE]' if IS_WINDOWS else '💾',
+    'reload': '[RELOAD]' if IS_WINDOWS else '🔄',
+    'new': '[NEW]' if IS_WINDOWS else '🆕',
+    'skip': 'SKIP' if IS_WINDOWS else '⏭',
+    'compress': '[ZIP]' if IS_WINDOWS else '🗜️',
+    'party': '[DONE]' if IS_WINDOWS else '🎉',
+    'target': '[FIND]' if IS_WINDOWS else '🎯',
+    'empty': '[EMPTY]' if IS_WINDOWS else '📭',
+    'list': '[LIST]' if IS_WINDOWS else '📋',
+    'drive': '[DRIVE]' if IS_WINDOWS else '🚗',
+    'thinking': '[?]' if IS_WINDOWS else '🤔',
+    'edit': '[EDIT]' if IS_WINDOWS else '📝',
+}
+
 # Cross-platform file locking
 try:
     import fcntl  # Unix/Linux/macOS
@@ -462,11 +503,16 @@ class UploadCache:
         self.cache = self._load_cache()
     
     def _load_cache(self) -> dict:
-        """Load the cache from file"""
+        """Load the cache from file with file locking for multiprocessing safety"""
         try:
             if self.cache_file.exists():
                 with open(self.cache_file, 'r') as f:
-                    return json.load(f)
+                    lock_file(f)  # Lock file for reading
+                    try:
+                        data = json.load(f)
+                    finally:
+                        unlock_file(f)
+                    return data
         except Exception as e:
             print(f"Warning: Could not load cache file: {e}")
         return {
@@ -477,10 +523,41 @@ class UploadCache:
         }
     
     def _save_cache(self):
-        """Save the cache to file"""
+        """Save the cache to file with file locking for multiprocessing safety"""
         try:
+            # First, reload the cache from disk to get latest state from other processes
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r') as f:
+                    lock_file(f)
+                    try:
+                        disk_cache = json.load(f)
+                    finally:
+                        unlock_file(f)
+                
+                # Merge successful_uploads (keep all entries from both)
+                if 'successful_uploads' in disk_cache:
+                    for file_id, data in disk_cache['successful_uploads'].items():
+                        if file_id not in self.cache['successful_uploads']:
+                            self.cache['successful_uploads'][file_id] = data
+                
+                # Merge failed_uploads
+                if 'failed_uploads' in disk_cache:
+                    for file_id, data in disk_cache['failed_uploads'].items():
+                        if file_id not in self.cache['failed_uploads'] and file_id not in self.cache['successful_uploads']:
+                            self.cache['failed_uploads'][file_id] = data
+            
+            # Now save the merged cache
             with open(self.cache_file, 'w') as f:
-                json.dump(self.cache, f, indent=2)
+                lock_file(f)  # Lock file for writing
+                try:
+                    json.dump(self.cache, f, indent=2)
+                    f.flush()  # Ensure data is written
+                    try:
+                        os.fsync(f.fileno())  # Force write to disk (may fail on some Windows systems)
+                    except (OSError, AttributeError):
+                        pass  # fsync not critical, flush is enough
+                finally:
+                    unlock_file(f)
         except Exception as e:
             print(f"Warning: Could not save cache file: {e}")
     
@@ -2073,7 +2150,7 @@ def get_images_from_gdrive_folder(service, folder_id, recursive=True, parent_pat
     
     return image_files
 
-def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=None, recursive=True, force_rescan=False):
+def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=None, recursive=True, force_rescan=False, retry_mode='auto'):
     """
     Upload images from a Google Drive folder to Cloudinary using multiprocessing.
     Supports resuming interrupted uploads through caching and recursive subfolder scanning.
@@ -2515,15 +2592,25 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
                     logging.info(f"  FAILED: {filename} (folder: {folder_path}) - Error: {error}")
                 logging.info("")
                 
-                # Offer retry option
-                print(f"\n🔄 RETRY FAILED UPLOADS?")
-                print(f"Would you like to retry the {len(failed_uploads)} failed uploads?")
-                print(f"  1. YES - Retry all failed uploads")
-                print(f"  2. NO - Skip retry")
+                # Determine if retry should happen based on retry_mode
+                should_retry = False
+                if retry_mode == 'true':
+                    should_retry = True
+                    print(f"\n🔄 RETRY MODE: Enabled (--retry true)")
+                elif retry_mode == 'false':
+                    should_retry = False
+                    print(f"\n⏭️  RETRY MODE: Disabled (--retry false) - Skipping retry")
+                elif retry_mode == 'auto':
+                    # Auto mode: retry if failed count is less than 10% of total
+                    failure_rate = len(failed_uploads) / len(image_files) if len(image_files) > 0 else 0
+                    should_retry = failure_rate < 0.1  # Retry if less than 10% failed
+                    print(f"\n🔄 RETRY MODE: Auto (failure rate: {failure_rate*100:.1f}%)")
+                    if should_retry:
+                        print(f"   ✅ Will retry (failure rate < 10%)")
+                    else:
+                        print(f"   ⏭️  Skipping retry (failure rate >= 10%, manual review recommended)")
                 
-                retry_choice = input("\nEnter your choice (1/2): ").strip()
-                
-                if retry_choice == '1':
+                if should_retry:
                     print(f"\n🔄 Retrying {len(failed_uploads)} failed uploads...")
                     logging.info(f"RETRYING FAILED UPLOADS: {len(failed_uploads)} files")
                     
@@ -2647,7 +2734,144 @@ def upload_gdrive_folder_to_cloudinary(folder_id, folder_name=None, max_workers=
     
     return results
 
+def batch_upload_from_csv(csv_file, max_workers=None, recursive=True, force_rescan=False, retry_mode='auto'):
+    """
+    Upload multiple Google Drive folders to Cloudinary from a CSV file.
+    
+    CSV Format:
+        folder_name,link
+        Destination Name 1,FOLDER_ID_1
+        Destination Name 2,FOLDER_ID_2
+    
+    Args:
+        csv_file (str): Path to CSV file containing folder_name and link columns
+        max_workers (int): Number of worker processes per upload
+        recursive (bool): If True, scan subfolders recursively
+        force_rescan (bool): If True, ignore cached folder scans
+        retry_mode (str): 'auto', 'true', or 'false' - controls retry behavior
+    
+    Returns:
+        dict: Summary of batch upload results
+    """
+    print(f"\n{'='*80}")
+    print(f"BATCH UPLOAD FROM CSV")
+    print(f"{'='*80}\n")
+    
+    # Check if CSV file exists
+    csv_path = Path(csv_file)
+    if not csv_path.exists():
+        print(f"❌ Error: CSV file not found: {csv_file}")
+        return None
+    
+    # Read CSV file
+    folders_to_upload = []
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if 'folder_name' in row and 'link' in row:
+                    folders_to_upload.append({
+                        'folder_name': row['folder_name'].strip(),
+                        'folder_id': row['link'].strip()
+                    })
+                else:
+                    print(f"⚠️  Warning: CSV must have 'folder_name' and 'link' columns")
+                    return None
+    except Exception as e:
+        print(f"❌ Error reading CSV file: {e}")
+        return None
+    
+    if not folders_to_upload:
+        print(f"❌ No folders found in CSV file")
+        return None
+    
+    print(f"📊 Found {len(folders_to_upload)} folders to upload:")
+    for i, folder in enumerate(folders_to_upload, 1):
+        print(f"  {i}. {folder['folder_name']} (ID: {folder['folder_id']})")
+    print()
+    
+    # Batch upload summary
+    batch_results = {
+        'total': len(folders_to_upload),
+        'completed': 0,
+        'failed': 0,
+        'folders': []
+    }
+    
+    batch_start_time = time.time()
+    
+    # Upload each folder sequentially
+    for i, folder in enumerate(folders_to_upload, 1):
+        print(f"\n{'='*80}")
+        print(f"UPLOADING FOLDER {i}/{len(folders_to_upload)}: {folder['folder_name']}")
+        print(f"{'='*80}\n")
+        
+        folder_start_time = time.time()
+        
+        try:
+            # Call the main upload function
+            upload_gdrive_folder_to_cloudinary(
+                folder_id=folder['folder_id'],
+                folder_name=folder['folder_name'],
+                max_workers=max_workers,
+                recursive=recursive,
+                force_rescan=force_rescan,
+                retry_mode=retry_mode
+            )
+            
+            folder_elapsed = time.time() - folder_start_time
+            batch_results['completed'] += 1
+            batch_results['folders'].append({
+                'name': folder['folder_name'],
+                'status': 'success',
+                'time': folder_elapsed
+            })
+            
+            print(f"\n✅ Folder '{folder['folder_name']}' completed in {folder_elapsed:.2f} seconds")
+            
+        except Exception as e:
+            folder_elapsed = time.time() - folder_start_time
+            batch_results['failed'] += 1
+            batch_results['folders'].append({
+                'name': folder['folder_name'],
+                'status': 'failed',
+                'error': str(e),
+                'time': folder_elapsed
+            })
+            
+            print(f"\n❌ Folder '{folder['folder_name']}' failed: {e}")
+            logging.error(f"Batch upload failed for folder '{folder['folder_name']}': {e}")
+    
+    # Print batch summary
+    batch_elapsed = time.time() - batch_start_time
+    
+    print(f"\n{'='*80}")
+    print(f"BATCH UPLOAD SUMMARY")
+    print(f"{'='*80}\n")
+    print(f"Total folders: {batch_results['total']}")
+    print(f"✅ Completed: {batch_results['completed']}")
+    print(f"❌ Failed: {batch_results['failed']}")
+    print(f"⏱️  Total time: {batch_elapsed:.2f} seconds ({batch_elapsed/60:.1f} minutes)")
+    
+    if batch_results['completed'] > 0:
+        avg_time = sum(f['time'] for f in batch_results['folders'] if f['status'] == 'success') / batch_results['completed']
+        print(f"📊 Average time per folder: {avg_time:.2f} seconds")
+    
+    # Show failed folders if any
+    if batch_results['failed'] > 0:
+        print(f"\n❌ Failed folders:")
+        for folder in batch_results['folders']:
+            if folder['status'] == 'failed':
+                print(f"  - {folder['name']}: {folder.get('error', 'Unknown error')}")
+    
+    print(f"\n{'='*80}\n")
+    
+    return batch_results
+
 if __name__ == "__main__":
+    # Required for Windows multiprocessing support
+    multiprocessing.freeze_support()
+    
     # Check if command argument is provided
     if len(sys.argv) < 2:
         print("Usage: python googledrive_tocloudinary.py <command> [arguments]")
@@ -2657,6 +2881,7 @@ if __name__ == "__main__":
         print("  drives                                  : List Shared Drives (Team Drives) and their folders")
         print("  cloudinary [--folder <name>]            : List all folders in Cloudinary or search for specific folder")
         print("  upload <folder_id_or_url> [options]     : Upload images from a Google Drive folder")
+        print("  batch-upload <csv_file> [options]       : Upload multiple folders from a CSV file")
         print("\nExamples:")
         print("  python googledrive_tocloudinary.py list        # Show your own folders")
         print("  python googledrive_tocloudinary.py shared      # Show folders shared with you")
@@ -2680,6 +2905,7 @@ if __name__ == "__main__":
         print("  workers          : Number of worker processes (optional, default: CPU count, optimized for speed)")  
         print("  --no-recursive   : Disable recursive scanning of subfolders (default: recursive enabled)")
         print("  --force-rescan   : Force rescan of Drive folder structure (ignore cached scan, useful if Drive changed)")
+        print("  --retry <mode>   : Retry mode for failed uploads (auto/true/false, default: auto)")
         print("\nSupported URL Formats:")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID")
         print("  ✓ https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing")
@@ -2862,6 +3088,68 @@ if __name__ == "__main__":
         print("\n💡 Use any folder ID above with the 'upload' command")
         
     # Handle "upload" command
+    elif command == "batch-upload":
+        if len(sys.argv) < 3:
+            print("Error: Please provide a CSV file path")
+            print("\nUsage: python googledrive_tocloudinary.py batch-upload <csv_file> [options]")
+            print("\nCSV Format:")
+            print("  folder_name,link")
+            print("  Destination Name 1,FOLDER_ID_1")
+            print("  Destination Name 2,FOLDER_ID_2")
+            print("\nOptions:")
+            print("  --workers <N>      : Number of worker processes per upload (default: CPU count)")
+            print("  --no-recursive     : Disable recursive scanning of subfolders")
+            print("  --force-rescan     : Force rescan of Drive folders (ignore cache)")
+            print("  --retry <mode>     : Retry mode for failed uploads (auto/true/false, default: auto)")
+            print("\nExamples:")
+            print("  python googledrive_tocloudinary.py batch-upload folders.csv")
+            print("  python googledrive_tocloudinary.py batch-upload folders.csv --workers 4 --retry true")
+            sys.exit(1)
+        
+        csv_file = sys.argv[2]
+        
+        # Parse arguments
+        args = sys.argv[3:]
+        MAX_WORKERS = None
+        RECURSIVE = True
+        FORCE_RESCAN = False
+        RETRY_MODE = 'auto'
+        
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--no-recursive":
+                RECURSIVE = False
+            elif arg == "--force-rescan":
+                FORCE_RESCAN = True
+            elif arg == "--retry" and i + 1 < len(args):
+                retry_value = args[i + 1].lower()
+                if retry_value in ['auto', 'true', 'false']:
+                    RETRY_MODE = retry_value
+                    i += 1
+                else:
+                    print(f"Warning: Invalid retry mode '{args[i + 1]}', using default (auto)")
+                    i += 1
+            elif (arg == "--threads" or arg == "--processes" or arg == "--workers") and i + 1 < len(args):
+                try:
+                    MAX_WORKERS = int(args[i + 1])
+                    i += 1
+                except ValueError:
+                    print(f"Warning: Invalid worker count '{args[i + 1]}', using default (CPU count)")
+                    i += 1
+            i += 1
+        
+        print(f"📄 CSV file: {csv_file}")
+        workers_display = MAX_WORKERS if MAX_WORKERS else multiprocessing.cpu_count()
+        print(f"🔄 Worker processes per upload: {workers_display}")
+        print(f"🔄 Recursive scanning: {'Enabled' if RECURSIVE else 'Disabled'}")
+        print(f"🔄 Retry mode: {RETRY_MODE}")
+        if FORCE_RESCAN:
+            print(f"🔄 Force rescan: Enabled")
+        print()
+        
+        batch_upload_from_csv(csv_file, max_workers=MAX_WORKERS, recursive=RECURSIVE, force_rescan=FORCE_RESCAN, retry_mode=RETRY_MODE)
+    
     elif command == "upload":
         if len(sys.argv) < 3:
             print("Error: Please provide a Google Drive folder ID or URL")
@@ -2910,6 +3198,7 @@ if __name__ == "__main__":
         MAX_WORKERS = None  # Will use CPU count by default for multiprocessing
         RECURSIVE = True  # Default to recursive
         FORCE_RESCAN = False  # Default to using cached scan
+        RETRY_MODE = 'auto'  # Default to auto retry mode
         
         # Process arguments
         i = 0
@@ -2919,6 +3208,15 @@ if __name__ == "__main__":
                 RECURSIVE = False
             elif arg == "--force-rescan":
                 FORCE_RESCAN = True
+            elif arg == "--retry" and i + 1 < len(args):
+                # Handle --retry argument
+                retry_value = args[i + 1].lower()
+                if retry_value in ['auto', 'true', 'false']:
+                    RETRY_MODE = retry_value
+                    i += 1  # Skip the next argument
+                else:
+                    print(f"Warning: Invalid retry mode '{args[i + 1]}', using default (auto)")
+                    i += 1
             elif (arg == "--threads" or arg == "--processes" or arg == "--workers") and i + 1 < len(args):
                 # Handle --threads/--processes/--workers argument
                 try:
@@ -2949,7 +3247,7 @@ if __name__ == "__main__":
             print(f"🔄 Force rescan: Enabled (will ignore cached folder scan)")
         print()
         
-        upload_gdrive_folder_to_cloudinary(FOLDER_ID, FOLDER_NAME, max_workers=MAX_WORKERS, recursive=RECURSIVE, force_rescan=FORCE_RESCAN)
+        upload_gdrive_folder_to_cloudinary(FOLDER_ID, FOLDER_NAME, max_workers=MAX_WORKERS, recursive=RECURSIVE, force_rescan=FORCE_RESCAN, retry_mode=RETRY_MODE)
     
     else:
         print(f"Error: Unknown command '{command}'")
