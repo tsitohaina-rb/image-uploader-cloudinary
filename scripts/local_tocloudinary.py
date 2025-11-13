@@ -378,7 +378,7 @@ def upload_worker(file_path, folder_name, cache_file, output_format='jpg', uploa
         return {
             'local_filename': safe_file_stem,
             'cloudinary_url': cached_data['cloudinary_url'],
-            'format_url': format_url,
+            f'{output_format}_url' if output_format != 'auto' else 'format_url': format_url,
             'status': 'skipped',
             'skip_reason': 'cache',
             'public_id': cached_data.get('public_id', ''),
@@ -474,7 +474,7 @@ def upload_worker(file_path, folder_name, cache_file, output_format='jpg', uploa
         result = {
             'local_filename': safe_file_stem,
             'cloudinary_url': response['secure_url'],
-            'format_url': format_url,
+            f'{output_format}_url' if output_format != 'auto' else 'format_url': format_url,
             'status': 'success',
             'public_id': response.get('public_id', ''),
             'file_size': file_size,
@@ -493,6 +493,7 @@ def upload_worker(file_path, folder_name, cache_file, output_format='jpg', uploa
         return {
             'local_filename': safe_file_stem,
             'cloudinary_url': 'UPLOAD_FAILED',
+            f'{output_format}_url' if output_format != 'auto' else 'format_url': 'UPLOAD_FAILED',
             'status': 'failed',
             'error': error_message,
             'file_path': file_path  # Include for cache update

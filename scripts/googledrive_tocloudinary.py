@@ -1566,7 +1566,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         jpg_url = original_url
         if is_cloudinary_url(original_url):
             current_format = get_current_format(original_url)
-            if current_format == 'png':
+            if current_format and current_format.lower() != 'jpg' and current_format.lower() != 'jpeg':
                 jpg_url = convert_cloudinary_url_to_jpg(original_url)
         
         return {
@@ -1575,7 +1575,8 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             'jpg_url': jpg_url,
             'status': 'skipped',
             'public_id': cached_data.get('public_id', ''),
-            'folder_path': folder_path
+            'folder_path': folder_path,
+            'filename': filename  # Add filename to result
         }
 
     # Initialize permission tracking
@@ -1643,15 +1644,24 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
 
         # 4) Upload to Cloudinary (using compressed data if available)
         try:
-            # Create public_id with folder prefix to match checking logic
-            complete_public_id = f"{cloudinary_folder}/{file_stem}"
+            # FIXED: Create proper folder structure in Cloudinary
+            if folder_path:
+                # If there's a subfolder path, include it in the folder structure
+                complete_folder_path = f"{cloudinary_folder}/{folder_path}"
+            else:
+                # If no subfolder, just use the base folder name
+                complete_folder_path = cloudinary_folder
+            
+            # Create public_id WITHOUT folder prefix - let 'folder' parameter handle it
+            file_stem_clean = sanitize_cloudinary_public_id(file_stem)
             
             # Use compressed data if available, otherwise use direct URL
             if compressed_data:
                 # Create a BytesIO object for uploading binary data
                 upload_source = io.BytesIO(compressed_data)
                 upload_kwargs = {
-                    'public_id': complete_public_id,  # Use full path as public_id to match checking logic
+                    'public_id': file_stem_clean,  # Just the filename, not the full path
+                    'folder': complete_folder_path,  # Use 'folder' parameter for proper folder creation
                     'use_filename': False,
                     'unique_filename': False,
                     'overwrite': True,
@@ -1662,7 +1672,8 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
             else:
                 upload_source = download_url
                 upload_kwargs = {
-                    'public_id': complete_public_id,  # Use full path as public_id to match checking logic
+                    'public_id': file_stem_clean,  # Just the filename, not the full path
+                    'folder': complete_folder_path,  # Use 'folder' parameter for proper folder creation
                     'use_filename': False,
                     'unique_filename': False,
                     'overwrite': True,
@@ -1702,7 +1713,7 @@ def upload_single_image_from_gdrive(service, file_info, base_folder_name, cache)
         original_url = response['secure_url']
         if is_cloudinary_url(original_url):
             current_format = get_current_format(original_url)
-            if current_format == 'png':
+            if current_format and current_format.lower() != 'jpg' and current_format.lower() != 'jpeg':
                 result['jpg_url'] = convert_cloudinary_url_to_jpg(original_url)
                 logging.info(f"  [JPG] Generated JPG URL: {filename}")
             else:
